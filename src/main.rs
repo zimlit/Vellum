@@ -18,6 +18,7 @@
 mod dmabuf;
 mod gbm;
 mod kms;
+mod logging;
 mod session;
 mod signals;
 mod vk;
@@ -75,14 +76,30 @@ struct Buffer<'a> {
     rendered: Arc<vk::Semaphore>,
     // The dma-buf keeps the memory alive on its own; holding the BO just
     // keeps GBM's view of it valid for the buffer's lifetime.
-    bo: gbm::Bo<'a>,
+    _bo: gbm::Bo<'a>,
 }
 
 fn main() -> ExitCode {
+    let mut log = logging::init();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        log_file = ?log.file,
+        "starting"
+    );
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vellum: {e:#}");
+            tracing::error!("{e:#}");
+            if let Some(console) = &mut log.console {
+                // Started from a VT, which is back in text mode now that the
+                // seat is released: say why we failed where the user is
+                // looking. (Best effort; nothing to do if this fails.)
+                use std::io::Write;
+                let _ = writeln!(console, "vellum: {e:#}");
+                if let Some(file) = &log.file {
+                    let _ = writeln!(console, "vellum: log: {}", file.display());
+                }
+            }
             ExitCode::FAILURE
         }
     }
@@ -90,11 +107,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = Args::parse()?;
-    // Before anything else (and before any threads exist).
+    // Before any threads exist, so they all inherit the blocked mask.
     let signals = SignalFd::new(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT])
         .context("setting up signalfd")?;
     let path = kms::find_card()?;
-    eprintln!("vellum: using {}", path.display());
+    tracing::info!(card = %path.display(), "using DRM device");
 
     if args.probe {
         let card = Card::open_direct(&path)?;
@@ -123,15 +140,15 @@ fn run() -> Result<()> {
     // when unwinding from a panic.
     let mut display =
         kms::Display::take_over(&card, &output, &buffers[0].fb, session.active_flag())?;
-    eprintln!(
-        "vellum: {}x{} on {} via {}; exiting in {}",
-        output.mode.size().0,
-        output.mode.size().1,
-        output.connector_name,
-        device.name(),
+    let (w, h) = output.mode.size();
+    tracing::info!(
+        connector = %output.connector_name,
+        mode = %format_args!("{w}x{h}@{}", output.mode.vrefresh()),
+        gpu = device.name(),
+        "display taken over; running {}",
         match args.seconds {
-            0 => "never (send SIGTERM or switch VT)".to_owned(),
-            s => format!("{s}s"),
+            0 => "until SIGTERM or VT switch".to_owned(),
+            s => format!("for {s}s"),
         }
     );
 
@@ -174,14 +191,14 @@ fn run() -> Result<()> {
         };
 
         if signal_ready && let Some(sig) = signals.read()? {
-            eprintln!("vellum: received {}, exiting", signals::name(sig));
+            tracing::info!(signal = signals::name(sig), "exiting on signal");
             break;
         }
         if seat_ready {
             session.dispatch()?;
             if !session.active() {
                 // VT switching proper is roadmap step 3; for now just leave.
-                eprintln!("vellum: session disabled (VT switched away), exiting");
+                tracing::info!("session disabled (VT switched away), exiting");
                 break;
             }
         }
@@ -190,14 +207,17 @@ fn run() -> Result<()> {
             // no longer scanned out and can be rendered into.
             flips += 1;
             (shown, queued) = (queued, shown);
+            tracing::trace!(flips, shown, "page flip completed");
             queue_frame(&mut display, &mut buffers[queued], start)?;
         }
     }
 
     let secs = start.elapsed().as_secs_f64();
-    eprintln!(
-        "vellum: {flips} flips in {secs:.1}s ({:.1} Hz)",
-        flips as f64 / secs
+    tracing::info!(
+        flips,
+        seconds = %format_args!("{secs:.1}"),
+        rate_hz = %format_args!("{:.1}", flips as f64 / secs),
+        "shutting down"
     );
     Ok(())
 }
@@ -206,13 +226,25 @@ fn run() -> Result<()> {
 fn prepare(card: &Card) -> Result<Output> {
     card.set_client_capability(ClientCapability::Atomic, true)
         .context("enabling DRM_CLIENT_CAP_ATOMIC (driver lacks atomic modesetting?)")?;
-    kms::select_output(card)
+    let output = kms::select_output(card)?;
+    let (w, h) = output.mode.size();
+    tracing::info!(
+        connector = %output.connector_name,
+        mode = %format_args!("{w}x{h}@{}", output.mode.vrefresh()),
+        crtc = ?output.crtc,
+        plane = ?output.plane,
+        "selected output"
+    );
+    Ok(output)
 }
 
 /// The Vulkan device on the same GPU as `card`.
 fn vulkan_device(instance: &Arc<vk::Instance>, card: &Card) -> Result<Arc<vk::Device>> {
     let rdev = rustix::fs::fstat(card)?.st_rdev;
-    vk::Device::for_drm_node(instance, rustix::fs::major(rdev), rustix::fs::minor(rdev))
+    let (major, minor) = (rustix::fs::major(rdev), rustix::fs::minor(rdev));
+    let device = vk::Device::for_drm_node(instance, major, minor)?;
+    tracing::info!(gpu = device.name(), drm_node = %format_args!("{major}:{minor}"), "created Vulkan device");
+    Ok(device)
 }
 
 /// Modifiers both the primary plane can scan out and Vulkan can import for
@@ -226,11 +258,25 @@ fn negotiate_modifiers(card: &Card, output: &Output, device: &vk::Device) -> Res
     }
     let kms = kms::plane_modifiers(card, &output.plane_props, FORMAT)?;
     let vulkan = device.dmabuf_modifiers(FORMAT, USAGE)?;
-    let common: Vec<u64> = kms
-        .iter()
-        .copied()
-        .filter(|m| vulkan.iter().any(|v| v.modifier == *m))
-        .collect();
+    let mut common = Vec::new();
+    for &m in &kms {
+        let vk = vulkan.iter().find(|v| v.modifier == m);
+        tracing::debug!(
+            modifier = %format_args!("{m:#018x}"),
+            vulkan_planes = vk.map(|v| v.plane_count),
+            "plane modifier{}",
+            if vk.is_some() { "" } else { " (not importable by Vulkan)" }
+        );
+        if vk.is_some() {
+            common.push(m);
+        }
+    }
+    tracing::info!(
+        plane = kms.len(),
+        vulkan = vulkan.len(),
+        common = common.len(),
+        "negotiated format modifiers"
+    );
     if common.is_empty() {
         bail!(
             "no format modifier is supported by both the plane ({} candidates) and Vulkan ({})",
@@ -259,12 +305,19 @@ fn create_buffer<'a>(
         )
         .context("gbm_bo_create_with_modifiers2")?;
     let dmabuf = bo.export().context("exporting dma-buf")?;
+    tracing::debug!(
+        size = %format_args!("{}x{}", dmabuf.width, dmabuf.height),
+        format = ?dmabuf.format,
+        modifier = %format_args!("{:#018x}", u64::from(dmabuf.modifier)),
+        planes = ?dmabuf.planes.iter().map(|p| (p.offset, p.stride)).collect::<Vec<_>>(),
+        "allocated scanout buffer (planes as (offset, stride))"
+    );
     Ok(Buffer {
         image: vk::DmaBufImage::import(device, &dmabuf, USAGE)?,
         fb: Framebuffer::import(card, &dmabuf)?,
         cmd: vk::CommandBuffer::new(device)?,
         rendered: vk::Semaphore::new_exportable(device)?,
-        bo,
+        _bo: bo,
     })
 }
 
@@ -308,58 +361,23 @@ fn animated_color(t: Duration) -> [f32; 4] {
 /// Everything short of the modeset, without a seat. Useful from SSH or from
 /// inside another graphical session to check device/plane/modifier selection
 /// and that Vulkan can import and render into the scanout buffers.
+///
+/// The interesting details (output, GPU, modifiers, buffer layout) are logged
+/// by the shared setup functions; run with `VELLUM_LOG=debug` to see them all.
 fn probe(card: &Card) -> Result<()> {
     let output = prepare(card)?;
-    let (w, h) = output.mode.size();
-    println!(
-        "output:    {} (connector {:?}), mode {}x{}@{}",
-        output.connector_name,
-        output.connector,
-        w,
-        h,
-        output.mode.vrefresh()
-    );
-    println!("crtc:      {:?}", output.crtc);
-    println!("plane:     {:?}", output.plane);
-
     let instance = vk::Instance::new(cfg!(debug_assertions))?;
     let device = vulkan_device(&instance, card)?;
-    println!("vulkan:    {}", device.name());
-
-    let kms_mods = kms::plane_modifiers(card, &output.plane_props, FORMAT)?;
-    let vk_mods = device.dmabuf_modifiers(FORMAT, USAGE)?;
-    println!("modifiers (plane / vulkan import for color attachment):");
-    for m in &kms_mods {
-        let vulkan = vk_mods.iter().find(|v| v.modifier == *m);
-        println!(
-            "  {m:#018x} {:<12} {}",
-            match vulkan {
-                Some(v) => format!("{} plane(s)", v.plane_count),
-                None => "-".to_owned(),
-            },
-            if vulkan.is_some() {
-                "both"
-            } else {
-                "plane only"
-            }
-        );
-    }
-
     let gbm = gbm::Device::new(card.as_fd()).context("gbm_create_device")?;
     let modifiers = negotiate_modifiers(card, &output, &device)?;
     let mut buf = create_buffer(card, &gbm, &device, &output, &modifiers)?;
     let start = Instant::now();
     render(&mut buf, start)?;
     buf.cmd.wait()?;
-    println!(
-        "buffer:    {}x{} {:?}, modifier {:#018x}, framebuffer {:?}",
-        w,
-        h,
-        FORMAT,
-        buf.bo.modifier(),
-        buf.fb.handle
+    tracing::info!(
+        render_time = ?start.elapsed(),
+        framebuffer = ?buf.fb.handle,
+        "probe ok: rendered one frame (modeset skipped: needs DRM master via the seat)"
     );
-    println!("rendered one frame in {:.2?}", start.elapsed());
-    println!("probe ok (modeset skipped: needs DRM master via the seat)");
     Ok(())
 }

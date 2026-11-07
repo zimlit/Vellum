@@ -275,7 +275,7 @@ impl Drop for GemHandles<'_> {
     fn drop(&mut self) {
         for &h in &self.handles {
             if let Err(e) = self.card.close_buffer(h) {
-                eprintln!("vellum: closing GEM handle failed: {e}");
+                tracing::warn!("closing GEM handle failed: {e}");
             }
         }
     }
@@ -372,7 +372,7 @@ impl<'a> Framebuffer<'a> {
 impl Drop for Framebuffer<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.card.destroy_framebuffer(self.handle) {
-            eprintln!("vellum: DRM_IOCTL_MODE_RMFB failed: {e}");
+            tracing::warn!("DRM_IOCTL_MODE_RMFB failed: {e}");
         }
     }
 }
@@ -665,13 +665,15 @@ impl Drop for Display<'_> {
         // If the session was disabled we no longer hold DRM master; whoever
         // owns the VT now owns the display.
         if !self.session_active.get() {
+            tracing::debug!("session inactive; leaving display state to the new VT owner");
             return;
         }
         if let Err(e) = self.wait_for_pending_flip() {
-            eprintln!("vellum: {e:#}");
+            tracing::warn!("{e:#}");
         }
-        if let Err(e) = self.saved.restore(self.card) {
-            eprintln!("vellum: failed to restore display state: {e:#}");
+        match self.saved.restore(self.card) {
+            Ok(()) => tracing::debug!("restored previous display state"),
+            Err(e) => tracing::error!("failed to restore display state: {e:#}"),
         }
     }
 }

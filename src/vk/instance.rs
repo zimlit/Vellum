@@ -43,8 +43,8 @@ impl Instance {
                 .iter()
                 .any(|l| l.layer_name_as_c_str() == Ok(VALIDATION_LAYER));
             if !found {
-                eprintln!(
-                    "vellum: {} is not installed; running without validation",
+                tracing::warn!(
+                    "{} is not installed; running without validation",
                     VALIDATION_LAYER.to_string_lossy()
                 );
             }
@@ -79,8 +79,11 @@ impl Instance {
         let debug = if validation {
             let loader = ext::debug_utils::Instance::new(&entry, &raw);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                // Everything; the tracing filter decides what's shown.
                 .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
                         | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
                 )
                 .message_type(
@@ -124,25 +127,38 @@ impl Drop for Instance {
 
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+    types: vk::DebugUtilsMessageTypeFlagsEXT,
     data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user: *mut c_void,
 ) -> vk::Bool32 {
-    let level = if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
-        "error"
+    use vk::DebugUtilsMessageSeverityFlagsEXT as Severity;
+
+    // SAFETY: the layer passes a valid callback-data struct whose strings are
+    // NUL-terminated (or null).
+    let (id, message) = unsafe {
+        let Some(d) = data.as_ref() else {
+            return vk::FALSE;
+        };
+        let str_or = |p: *const c_char, default: &'static str| {
+            if p.is_null() {
+                default.into()
+            } else {
+                CStr::from_ptr(p).to_string_lossy()
+            }
+        };
+        (
+            str_or(d.p_message_id_name, "-"),
+            str_or(d.p_message, "<no message>"),
+        )
+    };
+
+    if severity.contains(Severity::ERROR) {
+        tracing::error!(target: "vulkan", ?types, %id, "{message}");
+    } else if severity.contains(Severity::WARNING) {
+        tracing::warn!(target: "vulkan", ?types, %id, "{message}");
     } else {
-        "warning"
-    };
-    // SAFETY: the layer passes a valid callback-data struct whose message is
-    // a NUL-terminated string (or null).
-    let message = unsafe {
-        data.as_ref()
-            .filter(|d| !d.p_message.is_null())
-            .map(|d| CStr::from_ptr(d.p_message).to_string_lossy())
-    };
-    eprintln!(
-        "vulkan {level}: {}",
-        message.as_deref().unwrap_or("<no message>")
-    );
+        // INFO and VERBOSE: loader/layer chatter, only useful when digging.
+        tracing::trace!(target: "vulkan", ?types, %id, "{message}");
+    }
     vk::FALSE
 }

@@ -32,7 +32,7 @@ impl Session {
                 // the flag drop and must not issue KMS commits afterwards.
                 flag.set(false);
                 if let Err(e) = seat.disable() {
-                    eprintln!("vellum: libseat_disable_seat failed: {e:?}");
+                    tracing::error!("libseat_disable_seat failed: {e:?}");
                 }
             }
         })
@@ -99,7 +99,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         for dev in self.devices.drain(..) {
             if let Err(e) = self.seat.close_device(dev) {
-                eprintln!("vellum: libseat_close_device failed: {e:?}");
+                tracing::warn!("libseat_close_device failed: {e:?}");
             }
         }
         // Dropping `seat` closes it, which releases the VT back to text mode.
