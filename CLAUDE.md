@@ -114,11 +114,11 @@ Notes:
 
 1. **KMS bring-up:** open the device via libseat, find connector/mode/CRTC/plane, allocate dma-buf, atomic commit of a solid color, clean restore on exit.
 2. **Vulkan bring-up:** instance/device with dma-buf import, render a clear color into the imported image, page-flip with fences.
-3. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly.
-4. **PTY:** `forkpty`/`openpty` into the session process; one `poll`/epoll loop over PTY, libinput, DRM and signalfd fds.
-5. **Text v0:** fontconfig + skrifa + CPU rasterizing (temporary) into the atlas; instanced cell renderer; raw shell output.
-6. **Terminal core:** VT parser, grid, scrollback, alternate screen, SGR attributes.
-7. **Input:** libinput + xkbcommon, key → escape-sequence encoding.
+3. **PTY:** `forkpty`/`openpty` into the session process; one `poll`/epoll loop over PTY, libinput, DRM and signalfd fds.
+4. **Text v0:** fontconfig + skrifa + CPU rasterizing (temporary) into the atlas; instanced cell renderer; raw shell output.
+5. **Terminal core:** VT parser, grid, scrollback, alternate screen, SGR attributes.
+6. **Input:** libinput + xkbcommon, key → escape-sequence encoding.
+7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Until then vellum exits cleanly when its session is disabled.
 8. **GPU compute rasterizer** replaces the CPU one; validate by diffing against FreeType/swash output for the same font, size and hinting.
 9. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
 10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).

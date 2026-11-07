@@ -197,7 +197,7 @@ fn run() -> Result<()> {
         if seat_ready {
             session.dispatch()?;
             if !session.active() {
-                // VT switching proper is roadmap step 3; for now just leave.
+                // VT switching proper is roadmap step 7; for now just leave.
                 tracing::info!("session disabled (VT switched away), exiting");
                 break;
             }
