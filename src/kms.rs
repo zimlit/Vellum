@@ -4,15 +4,16 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use drm::buffer::{self, DrmFourcc, DrmModifier, PlanarBuffer};
 use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode, ModeTypeFlags, ResourceHandle,
-    ResourceHandles, atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property,
+    AtomicCommitFlags, Device as ControlDevice, Event, FbCmd2Flags, Mode, ModeTypeFlags,
+    ResourceHandle, ResourceHandles, atomic::AtomicModeReq, connector, crtc, framebuffer, plane,
+    property,
 };
 
 use crate::dmabuf::DmaBuf;
@@ -80,11 +81,15 @@ pub struct Props(HashMap<String, (property::Handle, u64)>);
 
 impl Props {
     pub fn load<H: ResourceHandle>(card: &Card, handle: H) -> Result<Self> {
-        let set = card.get_properties(handle).context("DRM_IOCTL_MODE_OBJ_GETPROPERTIES")?;
+        let set = card
+            .get_properties(handle)
+            .context("DRM_IOCTL_MODE_OBJ_GETPROPERTIES")?;
         let (ids, values) = set.as_props_and_values();
         let mut map = HashMap::with_capacity(ids.len());
         for (&id, &value) in ids.iter().zip(values) {
-            let info = card.get_property(id).context("DRM_IOCTL_MODE_GETPROPERTY")?;
+            let info = card
+                .get_property(id)
+                .context("DRM_IOCTL_MODE_GETPROPERTY")?;
             map.insert(info.name().to_string_lossy().into_owned(), (id, value));
         }
         Ok(Self(map))
@@ -116,8 +121,12 @@ pub struct Output {
 /// plane for it. Prefers the CRTC the connector is already using (fbcon's),
 /// which avoids stealing a CRTC from another display.
 pub fn select_output(card: &Card) -> Result<Output> {
-    let res = card.resource_handles().context("DRM_IOCTL_MODE_GETRESOURCES")?;
-    let planes = card.plane_handles().context("DRM_IOCTL_MODE_GETPLANERESOURCES")?;
+    let res = card
+        .resource_handles()
+        .context("DRM_IOCTL_MODE_GETRESOURCES")?;
+    let planes = card
+        .plane_handles()
+        .context("DRM_IOCTL_MODE_GETPLANERESOURCES")?;
 
     for &conn_handle in res.connectors() {
         let mut conn = card.get_connector(conn_handle, false)?;
@@ -191,7 +200,9 @@ pub fn plane_modifiers(card: &Card, plane_props: &Props, format: DrmFourcc) -> R
     let Some(blob_id) = plane_props.value("IN_FORMATS").filter(|&id| id != 0) else {
         return Ok(Vec::new());
     };
-    let blob = card.get_property_blob(blob_id).context("reading IN_FORMATS blob")?;
+    let blob = card
+        .get_property_blob(blob_id)
+        .context("reading IN_FORMATS blob")?;
     parse_in_formats(&blob, format as u32)
 }
 
@@ -211,11 +222,15 @@ pub fn plane_modifiers(card: &Card, plane_props: &Props, format: DrmFourcc) -> R
 /// ```
 fn parse_in_formats(blob: &[u8], format: u32) -> Result<Vec<u64>> {
     let u32_at = |off: usize| -> Result<u32> {
-        let bytes = blob.get(off..off + 4).ok_or_else(|| anyhow!("IN_FORMATS blob truncated"))?;
+        let bytes = blob
+            .get(off..off + 4)
+            .ok_or_else(|| anyhow!("IN_FORMATS blob truncated"))?;
         Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
     };
     let u64_at = |off: usize| -> Result<u64> {
-        let bytes = blob.get(off..off + 8).ok_or_else(|| anyhow!("IN_FORMATS blob truncated"))?;
+        let bytes = blob
+            .get(off..off + 8)
+            .ok_or_else(|| anyhow!("IN_FORMATS blob truncated"))?;
         Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
     };
 
@@ -240,7 +255,8 @@ fn parse_in_formats(blob: &[u8], format: u32) -> Result<Vec<u64>> {
         let offset = u32_at(base + 8)? as usize;
         let modifier = u64_at(base + 16)?;
         // The mask covers formats[offset .. offset + 64].
-        let supported = index >= offset && index < offset + 64 && mask & (1 << (index - offset)) != 0;
+        let supported =
+            index >= offset && index < offset + 64 && mask & (1 << (index - offset)) != 0;
         // Drivers may list a modifier more than once (amdgpu repeats LINEAR).
         if supported && !modifiers.contains(&modifier) {
             modifiers.push(modifier);
@@ -308,7 +324,10 @@ impl<'a> Framebuffer<'a> {
     /// framebuffer with `DRM_IOCTL_MODE_ADDFB2`, with modifiers when known.
     pub fn import(card: &'a Card, buf: &DmaBuf) -> Result<Self> {
         if buf.planes.len() > 4 {
-            bail!("dma-buf has {} planes; KMS supports at most 4", buf.planes.len());
+            bail!(
+                "dma-buf has {} planes; KMS supports at most 4",
+                buf.planes.len()
+            );
         }
         let mut gem = GemHandles {
             card,
@@ -365,7 +384,10 @@ fn raw(value: u64) -> property::Value<'static> {
 }
 
 fn create_mode_blob(card: &Card, mode: &Mode) -> Result<u64> {
-    match card.create_property_blob(mode).context("creating MODE_ID blob")? {
+    match card
+        .create_property_blob(mode)
+        .context("creating MODE_ID blob")?
+    {
         property::Value::Blob(id) => Ok(id),
         other => bail!("unexpected blob value {other:?}"),
     }
@@ -388,12 +410,18 @@ struct SavedState {
     mode: Option<Mode>,
 }
 
-fn save<H: ResourceHandle>(card: &Card, h: H, names: &[&str]) -> Result<Vec<(property::Handle, u64)>> {
+fn save<H: ResourceHandle>(
+    card: &Card,
+    h: H,
+    names: &[&str],
+) -> Result<Vec<(property::Handle, u64)>> {
     let props = Props::load(card, h)?;
     names
         .iter()
         .map(|&name| {
-            let value = props.value(name).ok_or_else(|| anyhow!("missing {name:?} property"))?;
+            let value = props
+                .value(name)
+                .ok_or_else(|| anyhow!("missing {name:?} property"))?;
             Ok((props.handle(name)?, value))
         })
         .collect()
@@ -403,7 +431,10 @@ impl SavedState {
     fn capture(card: &Card, output: &Output) -> Result<Self> {
         let crtc_props = Props::load(card, output.crtc)?;
         Ok(Self {
-            connector: (output.connector, save(card, output.connector, CONNECTOR_PROPS)?),
+            connector: (
+                output.connector,
+                save(card, output.connector, CONNECTOR_PROPS)?,
+            ),
             crtc: (output.crtc, save(card, output.crtc, CRTC_PROPS)?),
             plane: (output.plane, save(card, output.plane, PLANE_PROPS)?),
             mode_id: crtc_props.handle("MODE_ID")?,
@@ -422,8 +453,16 @@ impl SavedState {
         for &(prop, value) in &self.plane.1 {
             req.add_property(self.plane.0, prop, raw(value));
         }
-        let blob = self.mode.as_ref().map(|m| create_mode_blob(card, m)).transpose()?;
-        req.add_property(self.crtc.0, self.mode_id, property::Value::Blob(blob.unwrap_or(0)));
+        let blob = self
+            .mode
+            .as_ref()
+            .map(|m| create_mode_blob(card, m))
+            .transpose()?;
+        req.add_property(
+            self.crtc.0,
+            self.mode_id,
+            property::Value::Blob(blob.unwrap_or(0)),
+        );
 
         let result = card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
         if let Some(id) = blob {
@@ -438,6 +477,11 @@ impl SavedState {
 /// dropping it restores whatever was there before (typically fbcon).
 pub struct Display<'a> {
     card: &'a Card,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+    fb_id_prop: property::Handle,
+    in_fence_prop: Option<property::Handle>,
+    flip_pending: bool,
     saved: SavedState,
     session_active: Rc<Cell<bool>>,
 }
@@ -466,25 +510,52 @@ impl<'a> Display<'a> {
             conn_props.handle("CRTC_ID")?,
             property::Value::CRTC(Some(output.crtc)),
         );
-        req.add_property(output.crtc, crtc_props.handle("MODE_ID")?, property::Value::Blob(mode_blob));
-        req.add_property(output.crtc, crtc_props.handle("ACTIVE")?, property::Value::Boolean(true));
+        req.add_property(
+            output.crtc,
+            crtc_props.handle("MODE_ID")?,
+            property::Value::Blob(mode_blob),
+        );
+        req.add_property(
+            output.crtc,
+            crtc_props.handle("ACTIVE")?,
+            property::Value::Boolean(true),
+        );
         let p = output.plane;
-        req.add_property(p, plane_props.handle("FB_ID")?, property::Value::Framebuffer(Some(fb.handle)));
-        req.add_property(p, plane_props.handle("CRTC_ID")?, property::Value::CRTC(Some(output.crtc)));
+        req.add_property(
+            p,
+            plane_props.handle("FB_ID")?,
+            property::Value::Framebuffer(Some(fb.handle)),
+        );
+        req.add_property(
+            p,
+            plane_props.handle("CRTC_ID")?,
+            property::Value::CRTC(Some(output.crtc)),
+        );
         // Source rectangle is in 16.16 fixed point, destination in pixels.
         req.add_property(p, plane_props.handle("SRC_X")?, raw(0));
         req.add_property(p, plane_props.handle("SRC_Y")?, raw(0));
         req.add_property(p, plane_props.handle("SRC_W")?, raw(w << 16));
         req.add_property(p, plane_props.handle("SRC_H")?, raw(h << 16));
-        req.add_property(p, plane_props.handle("CRTC_X")?, property::Value::SignedRange(0));
-        req.add_property(p, plane_props.handle("CRTC_Y")?, property::Value::SignedRange(0));
+        req.add_property(
+            p,
+            plane_props.handle("CRTC_X")?,
+            property::Value::SignedRange(0),
+        );
+        req.add_property(
+            p,
+            plane_props.handle("CRTC_Y")?,
+            property::Value::SignedRange(0),
+        );
         req.add_property(p, plane_props.handle("CRTC_W")?, raw(w));
         req.add_property(p, plane_props.handle("CRTC_H")?, raw(h));
 
         // TEST_ONLY first so a rejected configuration fails before anything
         // on screen changes.
         let result = card
-            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY, req.clone())
+            .atomic_commit(
+                AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                req.clone(),
+            )
             .context("atomic test commit rejected")
             .and_then(|()| {
                 card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
@@ -496,9 +567,96 @@ impl<'a> Display<'a> {
 
         Ok(Self {
             card,
+            crtc: output.crtc,
+            plane: output.plane,
+            fb_id_prop: plane_props.handle("FB_ID")?,
+            in_fence_prop: plane_props.handle("IN_FENCE_FD").ok(),
+            flip_pending: false,
             saved,
             session_active,
         })
+    }
+
+    /// Queue `fb` to be shown at the next vblank, without blocking. If
+    /// `in_fence` (a sync_file) is given, the kernel waits for it to signal
+    /// before scanning out. Completion is reported by a page-flip event; see
+    /// [`Display::dispatch_events`]. Only one flip may be pending at a time.
+    pub fn flip(&mut self, fb: &Framebuffer, in_fence: Option<&OwnedFd>) -> Result<()> {
+        if self.flip_pending {
+            bail!("a page flip is already pending");
+        }
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.plane,
+            self.fb_id_prop,
+            property::Value::Framebuffer(Some(fb.handle)),
+        );
+        if let Some(fence) = in_fence {
+            let prop = self
+                .in_fence_prop
+                .ok_or_else(|| anyhow!("plane has no IN_FENCE_FD property"))?;
+            // The kernel takes its own reference during the ioctl; the fd can
+            // be closed as soon as the commit returns.
+            req.add_property(
+                self.plane,
+                prop,
+                property::Value::SignedRange(i64::from(fence.as_raw_fd())),
+            );
+        }
+        self.card
+            .atomic_commit(
+                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                req,
+            )
+            .context("page flip commit")?;
+        self.flip_pending = true;
+        Ok(())
+    }
+
+    /// Read pending DRM events from the card fd (call when it's readable).
+    /// Returns true if our pending flip completed, i.e. the last flipped
+    /// framebuffer is now on screen and the previous one is free to reuse.
+    pub fn dispatch_events(&mut self) -> Result<bool> {
+        let mut flipped = false;
+        for event in self.card.receive_events().context("reading DRM events")? {
+            if let Event::PageFlip(e) = event
+                && e.crtc == self.crtc
+            {
+                flipped = true;
+            }
+        }
+        if flipped {
+            self.flip_pending = false;
+        }
+        Ok(flipped)
+    }
+
+    /// Block (up to a timeout) until a pending flip completes. A new commit
+    /// while one is in flight fails with EBUSY, including the restore commit.
+    fn wait_for_pending_flip(&mut self) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while self.flip_pending {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                bail!("timed out waiting for page flip");
+            }
+            let timeout = rustix::event::Timespec {
+                tv_sec: left.as_secs() as _,
+                tv_nsec: left.subsec_nanos() as _,
+            };
+            let mut fds = [rustix::event::PollFd::new(
+                self.card,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                Ok(_) => {
+                    self.dispatch_events()?;
+                }
+                Err(e) => return Err(e).context("poll"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -508,6 +666,9 @@ impl Drop for Display<'_> {
         // owns the VT now owns the display.
         if !self.session_active.get() {
             return;
+        }
+        if let Err(e) = self.wait_for_pending_flip() {
+            eprintln!("vellum: {e:#}");
         }
         if let Err(e) = self.saved.restore(self.card) {
             eprintln!("vellum: failed to restore display state: {e:#}");

@@ -5,12 +5,11 @@
 //! downstream (KMS framebuffers now, Vulkan import later) consumes the dma-buf,
 //! never the GBM object itself.
 
-use std::ffi::c_void;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::BitOr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 
 use drm::buffer::{DrmFourcc, DrmModifier};
 
@@ -18,7 +17,7 @@ use crate::dmabuf::{DmaBuf, DmaBufPlane};
 
 #[allow(non_camel_case_types)]
 mod ffi {
-    use std::ffi::{c_int, c_uint, c_void};
+    use std::ffi::{c_int, c_uint};
 
     #[repr(C)]
     pub struct gbm_device {
@@ -29,8 +28,6 @@ mod ffi {
     pub struct gbm_bo {
         _opaque: [u8; 0],
     }
-
-    pub const GBM_BO_TRANSFER_WRITE: u32 = 1 << 1;
 
     #[link(name = "gbm")]
     unsafe extern "C" {
@@ -63,18 +60,6 @@ mod ffi {
         pub fn gbm_bo_get_stride_for_plane(bo: *mut gbm_bo, plane: c_int) -> u32;
         pub fn gbm_bo_get_offset(bo: *mut gbm_bo, plane: c_int) -> u32;
         pub fn gbm_bo_get_fd_for_plane(bo: *mut gbm_bo, plane: c_int) -> c_int;
-
-        pub fn gbm_bo_map(
-            bo: *mut gbm_bo,
-            x: u32,
-            y: u32,
-            width: u32,
-            height: u32,
-            flags: u32,
-            stride: *mut u32,
-            map_data: *mut *mut c_void,
-        ) -> *mut c_void;
-        pub fn gbm_bo_unmap(bo: *mut gbm_bo, map_data: *mut c_void);
     }
 }
 
@@ -212,75 +197,10 @@ impl Bo<'_> {
             planes,
         })
     }
-
-    /// Map the whole buffer for CPU writes. For tiled layouts the driver maps a
-    /// linear staging copy and blits it back on unmap, so this is slow but
-    /// layout-agnostic. Only meant for bring-up; real rendering goes via Vulkan.
-    pub fn map_write(&mut self) -> io::Result<Mapping<'_>> {
-        let (width, height) = (self.width(), self.height());
-        let mut stride = 0;
-        let mut map_data = ptr::null_mut();
-        // SAFETY: valid BO; out-pointers are valid for writes.
-        let ptr = unsafe {
-            ffi::gbm_bo_map(
-                self.raw.as_ptr(),
-                0,
-                0,
-                width,
-                height,
-                ffi::GBM_BO_TRANSFER_WRITE,
-                &mut stride,
-                &mut map_data,
-            )
-        };
-        let ptr = NonNull::new(ptr.cast::<u8>()).ok_or_else(io::Error::last_os_error)?;
-        Ok(Mapping {
-            bo: self.raw,
-            ptr,
-            map_data,
-            stride,
-            height,
-            _bo: PhantomData,
-        })
-    }
 }
 
 impl Drop for Bo<'_> {
     fn drop(&mut self) {
         unsafe { ffi::gbm_bo_destroy(self.raw.as_ptr()) }
-    }
-}
-
-/// A CPU mapping of a BO; unmapped (and flushed to the BO) on drop.
-pub struct Mapping<'bo> {
-    bo: NonNull<ffi::gbm_bo>,
-    ptr: NonNull<u8>,
-    map_data: *mut c_void,
-    stride: u32,
-    height: u32,
-    _bo: PhantomData<&'bo mut Bo<'bo>>,
-}
-
-impl Mapping<'_> {
-    /// Bytes per row of the mapping (may differ from the BO's own stride).
-    pub fn stride(&self) -> u32 {
-        self.stride
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: gbm_bo_map returns a region of at least stride * height bytes,
-        // exclusively ours until unmap.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr.as_ptr(),
-                self.stride as usize * self.height as usize,
-            )
-        }
-    }
-}
-
-impl Drop for Mapping<'_> {
-    fn drop(&mut self) {
-        unsafe { ffi::gbm_bo_unmap(self.bo.as_ptr(), self.map_data) }
     }
 }

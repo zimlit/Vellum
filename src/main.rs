@@ -1,28 +1,34 @@
-//! Roadmap step 1: KMS bring-up.
+//! Roadmap steps 1–2: KMS + Vulkan bring-up.
 //!
 //! Open the DRM device through libseat, pick a connector/mode/CRTC/primary
-//! plane, allocate a scanout buffer with GBM, export it as a dma-buf, import
-//! that as a KMS framebuffer, show it with an atomic commit, and restore the
-//! previous display state on exit (normal return, error, panic unwind, or a
-//! termination signal).
+//! plane, and allocate two scanout buffers with GBM using a format modifier
+//! both the plane and Vulkan support. Each buffer is exported as a dma-buf
+//! and imported twice: as a KMS framebuffer and as a Vulkan image. Vulkan
+//! clears the back buffer to an animated color; its completion semaphore is
+//! exported as a sync_file and handed to the page flip as `IN_FENCE_FD`, and
+//! page-flip events drive the next frame. The previous display state is
+//! restored on exit (normal return, error, panic unwind, or a termination
+//! signal).
 //!
 //! Usage: vellum [--probe] [--seconds N]
-//!   --probe      open the card directly (no seat, no DRM master), do
-//!                everything except the modeset, and print what was chosen
-//!   --seconds N  how long to show the color; 0 = until a signal (default 10)
+//!   --probe      open the card directly (no seat, no DRM master), render one
+//!                frame without showing it, and print what was chosen
+//!   --seconds N  how long to run; 0 = until a signal (default 10)
 
 mod dmabuf;
 mod gbm;
 mod kms;
 mod session;
 mod signals;
+mod vk;
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use drm::buffer::{DrmFourcc, DrmModifier};
+use drm::buffer::DrmFourcc;
 use drm::{ClientCapability, Device as DrmDevice, DriverCapability};
 use rustix::event::{PollFd, PollFlags, Timespec};
 
@@ -30,8 +36,9 @@ use crate::kms::{Card, Framebuffer, Output};
 use crate::session::Session;
 use crate::signals::SignalFd;
 
-/// Fill color, 0x00RRGGBB.
-const COLOR: u32 = 0x00_28_3c_5a;
+const FORMAT: DrmFourcc = DrmFourcc::Xrgb8888;
+const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+const BUFFER_COUNT: usize = 2;
 
 struct Args {
     probe: bool,
@@ -57,6 +64,18 @@ impl Args {
         }
         Ok(args)
     }
+}
+
+/// One scanout buffer: the same dma-buf seen by KMS and by Vulkan, plus the
+/// per-buffer GPU submission state.
+struct Buffer<'a> {
+    image: Arc<vk::DmaBufImage>,
+    fb: Framebuffer<'a>,
+    cmd: vk::CommandBuffer,
+    rendered: Arc<vk::Semaphore>,
+    // The dma-buf keeps the memory alive on its own; holding the BO just
+    // keeps GBM's view of it valid for the buffer's lifetime.
+    bo: gbm::Bo<'a>,
 }
 
 fn main() -> ExitCode {
@@ -85,27 +104,42 @@ fn run() -> Result<()> {
     let mut session = Session::open()?;
     let card = Card::new(session.open_device(&path)?);
     let output = prepare(&card)?;
-
+    let instance = vk::Instance::new(cfg!(debug_assertions))?;
+    let device = vulkan_device(&instance, &card)?;
     let gbm = gbm::Device::new(card.as_fd()).context("gbm_create_device")?;
-    let mut bo = allocate_scanout(&gbm, &card, &output)?;
-    fill(&mut bo, COLOR)?;
-    let dmabuf = bo.export().context("exporting dma-buf")?;
-    let fb = Framebuffer::import(&card, &dmabuf)?;
+    let modifiers = negotiate_modifiers(&card, &output, &device)?;
+    let mut buffers = (0..BUFFER_COUNT)
+        .map(|_| create_buffer(&card, &gbm, &device, &output, &modifiers))
+        .collect::<Result<Vec<_>>>()?;
 
-    // Locals drop in reverse order: the display state is restored first, then
-    // the framebuffer, buffers, card and finally the seat are released. This
-    // also holds when unwinding from a panic.
-    let _display = kms::Display::take_over(&card, &output, &fb, session.active_flag())?;
+    // First frame: render, wait on the CPU, and modeset with it.
+    let start = Instant::now();
+    render(&mut buffers[0], start)?;
+    buffers[0].cmd.wait()?;
+
+    // Locals drop in reverse order: the display state is restored first (after
+    // any pending flip lands), then GPU work is waited for and buffers, the
+    // device, the card and finally the seat are released. This also holds
+    // when unwinding from a panic.
+    let mut display =
+        kms::Display::take_over(&card, &output, &buffers[0].fb, session.active_flag())?;
     eprintln!(
-        "vellum: showing {}x{} on {}; exiting in {}",
-        dmabuf.width,
-        dmabuf.height,
+        "vellum: {}x{} on {} via {}; exiting in {}",
+        output.mode.size().0,
+        output.mode.size().1,
         output.connector_name,
+        device.name(),
         match args.seconds {
             0 => "never (send SIGTERM or switch VT)".to_owned(),
             s => format!("{s}s"),
         }
     );
+
+    // Buffer `shown` is on screen; `queued` is flipping to it next.
+    let mut shown = 0;
+    let mut queued = 1;
+    queue_frame(&mut display, &mut buffers[queued], start)?;
+    let mut flips = 0u64;
 
     let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
     loop {
@@ -123,18 +157,20 @@ fn run() -> Result<()> {
             None => None,
         };
 
-        let (seat_ready, signal_ready) = {
+        let (seat_ready, signal_ready, card_ready) = {
             let seat_fd = session.fd();
             let mut fds = [
                 PollFd::new(&seat_fd, PollFlags::IN),
                 PollFd::new(&signals, PollFlags::IN),
+                PollFd::new(&card, PollFlags::IN),
             ];
             match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(e).context("poll"),
             }
-            (!fds[0].revents().is_empty(), !fds[1].revents().is_empty())
+            let ready = |i: usize| !fds[i].revents().is_empty();
+            (ready(0), ready(1), ready(2))
         };
 
         if signal_ready && let Some(sig) = signals.read()? {
@@ -149,7 +185,20 @@ fn run() -> Result<()> {
                 break;
             }
         }
+        if card_ready && display.dispatch_events()? {
+            // `queued` is on screen now, so the previously shown buffer is
+            // no longer scanned out and can be rendered into.
+            flips += 1;
+            (shown, queued) = (queued, shown);
+            queue_frame(&mut display, &mut buffers[queued], start)?;
+        }
     }
+
+    let secs = start.elapsed().as_secs_f64();
+    eprintln!(
+        "vellum: {flips} flips in {secs:.1}s ({:.1} Hz)",
+        flips as f64 / secs
+    );
     Ok(())
 }
 
@@ -160,49 +209,105 @@ fn prepare(card: &Card) -> Result<Output> {
     kms::select_output(card)
 }
 
-/// Allocate an XRGB8888 scanout buffer the size of the mode, using a modifier
-/// the primary plane advertises when the driver supports explicit modifiers.
-fn allocate_scanout<'d>(gbm: &'d gbm::Device, card: &Card, output: &Output) -> Result<gbm::Bo<'d>> {
-    let (w, h) = output.mode.size();
-    let (w, h) = (u32::from(w), u32::from(h));
-    let format = DrmFourcc::Xrgb8888;
-    let flags = gbm::BoFlags::SCANOUT | gbm::BoFlags::RENDERING;
-
-    let modifiers_supported = card
-        .get_driver_capability(DriverCapability::AddFB2Modifiers)
-        .is_ok_and(|v| v != 0);
-    let modifiers = if modifiers_supported {
-        kms::plane_modifiers(card, &output.plane_props, format)?
-    } else {
-        Vec::new()
-    };
-
-    if !modifiers.is_empty() {
-        match gbm.create_bo(w, h, format, &modifiers, flags) {
-            Ok(bo) => return Ok(bo),
-            Err(e) => eprintln!("vellum: allocation with explicit modifiers failed ({e}); retrying implicit"),
-        }
-    }
-    gbm.create_bo(w, h, format, &[], flags).context("gbm_bo_create")
+/// The Vulkan device on the same GPU as `card`.
+fn vulkan_device(instance: &Arc<vk::Instance>, card: &Card) -> Result<Arc<vk::Device>> {
+    let rdev = rustix::fs::fstat(card)?.st_rdev;
+    vk::Device::for_drm_node(instance, rustix::fs::major(rdev), rustix::fs::minor(rdev))
 }
 
-fn fill(bo: &mut gbm::Bo, color: u32) -> Result<()> {
-    let (w, h) = (bo.width() as usize, bo.height() as usize);
-    let mut map = bo.map_write().context("gbm_bo_map")?;
-    let stride = map.stride() as usize;
-    let data = map.as_mut_slice();
-    // XRGB8888 is a little-endian packed u32: bytes B, G, R, X.
-    let pixel = color.to_le_bytes();
-    for y in 0..h {
-        for px in data[y * stride..y * stride + w * 4].chunks_exact_mut(4) {
-            px.copy_from_slice(&pixel);
-        }
+/// Modifiers both the primary plane can scan out and Vulkan can import for
+/// rendering, in the plane's order of preference.
+fn negotiate_modifiers(card: &Card, output: &Output, device: &vk::Device) -> Result<Vec<u64>> {
+    let explicit = card
+        .get_driver_capability(DriverCapability::AddFB2Modifiers)
+        .is_ok_and(|v| v != 0);
+    if !explicit {
+        bail!("KMS driver doesn't support framebuffer modifiers");
     }
-    Ok(())
+    let kms = kms::plane_modifiers(card, &output.plane_props, FORMAT)?;
+    let vulkan = device.dmabuf_modifiers(FORMAT, USAGE)?;
+    let common: Vec<u64> = kms
+        .iter()
+        .copied()
+        .filter(|m| vulkan.iter().any(|v| v.modifier == *m))
+        .collect();
+    if common.is_empty() {
+        bail!(
+            "no format modifier is supported by both the plane ({} candidates) and Vulkan ({})",
+            kms.len(),
+            vulkan.len()
+        );
+    }
+    Ok(common)
+}
+
+fn create_buffer<'a>(
+    card: &'a Card,
+    gbm: &'a gbm::Device<'_>,
+    device: &Arc<vk::Device>,
+    output: &Output,
+    modifiers: &[u64],
+) -> Result<Buffer<'a>> {
+    let (w, h) = output.mode.size();
+    let bo = gbm
+        .create_bo(
+            u32::from(w),
+            u32::from(h),
+            FORMAT,
+            modifiers,
+            gbm::BoFlags::SCANOUT | gbm::BoFlags::RENDERING,
+        )
+        .context("gbm_bo_create_with_modifiers2")?;
+    let dmabuf = bo.export().context("exporting dma-buf")?;
+    Ok(Buffer {
+        image: vk::DmaBufImage::import(device, &dmabuf, USAGE)?,
+        fb: Framebuffer::import(card, &dmabuf)?,
+        cmd: vk::CommandBuffer::new(device)?,
+        rendered: vk::Semaphore::new_exportable(device)?,
+        bo,
+    })
+}
+
+/// Record and submit this buffer's frame. Returns a sync_file that signals
+/// when rendering is done, or `None` if it already is.
+fn render(buf: &mut Buffer, start: Instant) -> Result<Option<OwnedFd>> {
+    let color = animated_color(start.elapsed());
+    let mut rec = buf.cmd.begin()?;
+    rec.acquire_from_foreign(&buf.image);
+    rec.clear(&buf.image, color);
+    rec.release_to_foreign(&buf.image);
+    rec.submit(Some(&buf.rendered))?;
+    buf.rendered.export_sync_file()
+}
+
+/// Render into `buf` and queue a flip to it, fenced on the rendering.
+fn queue_frame(display: &mut kms::Display, buf: &mut Buffer, start: Instant) -> Result<()> {
+    let fence = render(buf, start)?;
+    display.flip(&buf.fb, fence.as_ref())
+}
+
+/// Slowly cycling hue, so dropped or torn frames are visible.
+fn animated_color(t: Duration) -> [f32; 4] {
+    const PERIOD: f32 = 6.0;
+    let h = (t.as_secs_f32() / PERIOD).fract() * 6.0;
+    let (s, v) = (0.6, 0.5);
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r + m, g + m, b + m, 1.0]
 }
 
 /// Everything short of the modeset, without a seat. Useful from SSH or from
-/// inside another graphical session to check device/plane/modifier selection.
+/// inside another graphical session to check device/plane/modifier selection
+/// and that Vulkan can import and render into the scanout buffers.
 fn probe(card: &Card) -> Result<()> {
     let output = prepare(card)?;
     let (w, h) = output.mode.size();
@@ -217,29 +322,44 @@ fn probe(card: &Card) -> Result<()> {
     println!("crtc:      {:?}", output.crtc);
     println!("plane:     {:?}", output.plane);
 
-    let modifiers = kms::plane_modifiers(card, &output.plane_props, DrmFourcc::Xrgb8888)?;
-    println!("plane supports {} XRGB8888 modifiers:", modifiers.len());
-    for m in &modifiers {
-        println!("  {m:#018x} {:?}", DrmModifier::from(*m));
+    let instance = vk::Instance::new(cfg!(debug_assertions))?;
+    let device = vulkan_device(&instance, card)?;
+    println!("vulkan:    {}", device.name());
+
+    let kms_mods = kms::plane_modifiers(card, &output.plane_props, FORMAT)?;
+    let vk_mods = device.dmabuf_modifiers(FORMAT, USAGE)?;
+    println!("modifiers (plane / vulkan import for color attachment):");
+    for m in &kms_mods {
+        let vulkan = vk_mods.iter().find(|v| v.modifier == *m);
+        println!(
+            "  {m:#018x} {:<12} {}",
+            match vulkan {
+                Some(v) => format!("{} plane(s)", v.plane_count),
+                None => "-".to_owned(),
+            },
+            if vulkan.is_some() {
+                "both"
+            } else {
+                "plane only"
+            }
+        );
     }
 
     let gbm = gbm::Device::new(card.as_fd()).context("gbm_create_device")?;
-    let mut bo = allocate_scanout(&gbm, card, &output)?;
-    fill(&mut bo, COLOR)?;
-    let dmabuf = bo.export().context("exporting dma-buf")?;
+    let modifiers = negotiate_modifiers(card, &output, &device)?;
+    let mut buf = create_buffer(card, &gbm, &device, &output, &modifiers)?;
+    let start = Instant::now();
+    render(&mut buf, start)?;
+    buf.cmd.wait()?;
     println!(
-        "buffer:    {}x{} {:?}, modifier {:#018x} {:?}",
-        dmabuf.width,
-        dmabuf.height,
-        dmabuf.format,
-        u64::from(dmabuf.modifier),
-        dmabuf.modifier
+        "buffer:    {}x{} {:?}, modifier {:#018x}, framebuffer {:?}",
+        w,
+        h,
+        FORMAT,
+        buf.bo.modifier(),
+        buf.fb.handle
     );
-    for (i, p) in dmabuf.planes.iter().enumerate() {
-        println!("  plane {i}: stride {} offset {}", p.stride, p.offset);
-    }
-    let fb = Framebuffer::import(card, &dmabuf)?;
-    println!("framebuffer: {:?}", fb.handle);
+    println!("rendered one frame in {:.2?}", start.elapsed());
     println!("probe ok (modeset skipped: needs DRM master via the seat)");
     Ok(())
 }

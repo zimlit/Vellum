@@ -51,7 +51,10 @@ impl SignalFd {
             };
         }
         if n as usize != size {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short signalfd read"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short signalfd read",
+            ));
         }
         // SAFETY: the kernel filled the whole struct.
         Ok(Some(unsafe { info.assume_init() }.ssi_signo as c_int))
