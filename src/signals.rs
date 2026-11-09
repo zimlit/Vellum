@@ -76,3 +76,37 @@ pub fn name(sig: c_int) -> &'static str {
         _ => "signal",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Signal masks are per thread and each test runs on its own thread, so
+    // blocking here doesn't leak into other tests. Each test uses its own
+    // signal anyway, to stay independent of scheduling.
+
+    #[test]
+    fn read_without_pending_signal_returns_none() {
+        let fd = SignalFd::new(&[libc::SIGUSR1]).unwrap();
+        assert_eq!(fd.read().unwrap(), None);
+    }
+
+    #[test]
+    fn raised_signal_is_read_from_the_fd() {
+        let fd = SignalFd::new(&[libc::SIGUSR2]).unwrap();
+        // raise() targets the calling thread, where the signal is blocked,
+        // so it stays pending for the signalfd instead of killing us.
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR2) }, 0);
+        assert_eq!(fd.read().unwrap(), Some(libc::SIGUSR2));
+        assert_eq!(fd.read().unwrap(), None, "consumed");
+    }
+
+    #[test]
+    fn names_termination_signals() {
+        assert_eq!(name(libc::SIGINT), "SIGINT");
+        assert_eq!(name(libc::SIGTERM), "SIGTERM");
+        assert_eq!(name(libc::SIGHUP), "SIGHUP");
+        assert_eq!(name(libc::SIGQUIT), "SIGQUIT");
+        assert_eq!(name(libc::SIGUSR1), "signal");
+    }
+}

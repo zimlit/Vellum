@@ -204,3 +204,69 @@ impl Drop for Bo<'_> {
         unsafe { ffi::gbm_bo_destroy(self.raw.as_ptr()) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+
+    use super::*;
+    use crate::testutil;
+
+    #[test]
+    fn bo_flags_combine_bits() {
+        let flags = BoFlags::SCANOUT | BoFlags::RENDERING;
+        assert_eq!(flags.0, (1 << 0) | (1 << 2));
+        assert_eq!(BoFlags::LINEAR | BoFlags::LINEAR, BoFlags::LINEAR);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn implicit_bo_reports_size_and_format() {
+        let card = testutil::card();
+        let gbm = Device::new(card.as_fd()).unwrap();
+        let bo = gbm
+            .create_bo(
+                640,
+                480,
+                DrmFourcc::Xrgb8888,
+                &[],
+                BoFlags::SCANOUT | BoFlags::RENDERING,
+            )
+            .unwrap();
+        assert_eq!((bo.width(), bo.height()), (640, 480));
+        assert_eq!(bo.format(), DrmFourcc::Xrgb8888 as u32);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn linear_bo_exports_one_plane_dmabuf() {
+        let card = testutil::card();
+        let gbm = Device::new(card.as_fd()).unwrap();
+        let linear = u64::from(DrmModifier::Linear);
+        let bo = gbm
+            .create_bo(640, 480, DrmFourcc::Xrgb8888, &[linear], BoFlags::SCANOUT)
+            .unwrap();
+        assert_eq!(bo.modifier(), linear);
+
+        let buf = bo.export().unwrap();
+        assert_eq!((buf.width, buf.height), (640, 480));
+        assert_eq!(buf.format, DrmFourcc::Xrgb8888);
+        assert_eq!(buf.modifier, DrmModifier::Linear);
+        assert_eq!(buf.planes.len(), 1);
+        assert!(buf.planes[0].stride >= 640 * 4);
+        // Exported fds outlive the BO.
+        drop(bo);
+        assert!(rustix::fs::fstat(&buf.planes[0].fd).is_ok());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn zero_sized_bo_is_an_error() {
+        let card = testutil::card();
+        let gbm = Device::new(card.as_fd()).unwrap();
+        assert!(
+            gbm.create_bo(0, 0, DrmFourcc::Xrgb8888, &[], BoFlags::RENDERING)
+                .is_err()
+        );
+    }
+}

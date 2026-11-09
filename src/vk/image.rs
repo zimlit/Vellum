@@ -268,3 +268,46 @@ impl Drop for DmaBufImage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vk_format_matches_drm_byte_order() {
+        // XRGB8888 is bytes B,G,R,X in memory: B8G8R8A8 in Vulkan terms.
+        assert_eq!(
+            vk_format(DrmFourcc::Xrgb8888),
+            Some(vk::Format::B8G8R8A8_UNORM)
+        );
+        assert_eq!(
+            vk_format(DrmFourcc::Argb8888),
+            Some(vk::Format::B8G8R8A8_UNORM)
+        );
+        assert_eq!(
+            vk_format(DrmFourcc::Xbgr8888),
+            Some(vk::Format::R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            vk_format(DrmFourcc::Abgr8888),
+            Some(vk::Format::R8G8B8A8_UNORM)
+        );
+        assert_eq!(vk_format(DrmFourcc::Nv12), None);
+    }
+
+    #[test]
+    fn required_features_follow_usage() {
+        use vk::{FormatFeatureFlags as F, ImageUsageFlags as U};
+        assert_eq!(required_features(U::empty()), F::empty());
+        assert_eq!(required_features(U::COLOR_ATTACHMENT), F::COLOR_ATTACHMENT);
+        assert_eq!(required_features(U::SAMPLED), F::SAMPLED_IMAGE);
+        assert_eq!(
+            required_features(U::TRANSFER_SRC | U::TRANSFER_DST),
+            F::TRANSFER_SRC | F::TRANSFER_DST
+        );
+        assert_eq!(
+            required_features(U::COLOR_ATTACHMENT | U::SAMPLED),
+            F::COLOR_ATTACHMENT | F::SAMPLED_IMAGE
+        );
+    }
+}

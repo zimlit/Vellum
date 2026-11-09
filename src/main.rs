@@ -21,6 +21,8 @@ mod kms;
 mod logging;
 mod session;
 mod signals;
+#[cfg(test)]
+mod testutil;
 mod vk;
 
 use std::os::fd::{AsFd, OwnedFd};
@@ -48,11 +50,16 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    /// Parse arguments (without the program name).
+    fn parse_from(it: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut args = Args {
             probe: false,
             seconds: 10,
         };
-        let mut it = std::env::args().skip(1);
+        let mut it = it.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--probe" => args.probe = true,
@@ -258,7 +265,6 @@ fn negotiate_modifiers(card: &Card, output: &Output, device: &vk::Device) -> Res
     }
     let kms = kms::plane_modifiers(card, &output.plane_props, FORMAT)?;
     let vulkan = device.dmabuf_modifiers(FORMAT, USAGE)?;
-    let mut common = Vec::new();
     for &m in &kms {
         let vk = vulkan.iter().find(|v| v.modifier == m);
         tracing::debug!(
@@ -267,10 +273,9 @@ fn negotiate_modifiers(card: &Card, output: &Output, device: &vk::Device) -> Res
             "plane modifier{}",
             if vk.is_some() { "" } else { " (not importable by Vulkan)" }
         );
-        if vk.is_some() {
-            common.push(m);
-        }
     }
+    let vulkan_mods: Vec<u64> = vulkan.iter().map(|v| v.modifier).collect();
+    let common = intersect_modifiers(&kms, &vulkan_mods);
     tracing::info!(
         plane = kms.len(),
         vulkan = vulkan.len(),
@@ -285,6 +290,15 @@ fn negotiate_modifiers(card: &Card, output: &Output, device: &vk::Device) -> Res
         );
     }
     Ok(common)
+}
+
+/// Modifiers in both lists, in `preferred`'s order.
+fn intersect_modifiers(preferred: &[u64], other: &[u64]) -> Vec<u64> {
+    preferred
+        .iter()
+        .copied()
+        .filter(|m| other.contains(m))
+        .collect()
 }
 
 fn create_buffer<'a>(
@@ -380,4 +394,97 @@ fn probe(card: &Card) -> Result<()> {
         "probe ok: rendered one frame (modeset skipped: needs DRM master via the seat)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    fn args(list: &[&str]) -> Result<Args> {
+        Args::parse_from(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn args_defaults() {
+        let a = args(&[]).unwrap();
+        assert!(!a.probe);
+        assert_eq!(a.seconds, 10);
+    }
+
+    #[test]
+    fn args_flags() {
+        let a = args(&["--probe", "--seconds", "0"]).unwrap();
+        assert!(a.probe);
+        assert_eq!(a.seconds, 0);
+    }
+
+    #[test]
+    fn args_errors() {
+        assert!(args(&["--seconds"]).is_err(), "missing value");
+        assert!(args(&["--seconds", "ten"]).is_err(), "not a number");
+        assert!(args(&["--seconds", "-1"]).is_err(), "negative");
+        assert!(args(&["--bogus"]).is_err(), "unknown flag");
+    }
+
+    #[test]
+    fn intersect_modifiers_keeps_preferred_order() {
+        assert_eq!(intersect_modifiers(&[5, 3, 1, 0], &[0, 1, 5, 9]), [5, 1, 0]);
+        assert!(intersect_modifiers(&[1, 2], &[3, 4]).is_empty());
+        assert!(intersect_modifiers(&[], &[1]).is_empty());
+    }
+
+    #[test]
+    fn animated_color_is_valid_opaque_rgb() {
+        for ms in (0..12_000).step_by(37) {
+            let c = animated_color(Duration::from_millis(ms));
+            assert!(
+                c[..3].iter().all(|v| (0.0..=1.0).contains(v)),
+                "{c:?} at {ms}ms"
+            );
+            assert_eq!(c[3], 1.0);
+        }
+    }
+
+    #[test]
+    fn animated_color_starts_red_and_repeats() {
+        let at = |s: f32| animated_color(Duration::from_secs_f32(s));
+        // Hue 0: red is the dominant channel, green and blue equal.
+        let c = at(0.0);
+        assert!(c[0] > c[1] && c[1] == c[2]);
+        // 6 s period.
+        for (a, b) in at(1.3).iter().zip(at(7.3)) {
+            assert!((a - b).abs() < 1e-4);
+        }
+    }
+
+    /// The real setup path minus the modeset: output selection, modifier
+    /// negotiation, GBM allocation, KMS + Vulkan import, and rendering with
+    /// an exported fence that actually signals.
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn scanout_buffer_renders_and_signals_fence() {
+        let card = testutil::card();
+        let output = prepare(&card).unwrap();
+        let instance = vk::Instance::new(cfg!(debug_assertions)).unwrap();
+        let device = vulkan_device(&instance, &card).unwrap();
+        let gbm = gbm::Device::new(card.as_fd()).unwrap();
+        let modifiers = negotiate_modifiers(&card, &output, &device).unwrap();
+        assert!(!modifiers.is_empty());
+        let mut buf = create_buffer(&card, &gbm, &device, &output, &modifiers).unwrap();
+        assert!(modifiers.contains(&buf._bo.modifier()));
+
+        let start = Instant::now();
+        for _ in 0..3 {
+            if let Some(fence) = render(&mut buf, start).unwrap() {
+                let mut fds = [PollFd::new(&fence, PollFlags::IN)];
+                let timeout = Timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0,
+                };
+                assert_eq!(rustix::event::poll(&mut fds, Some(&timeout)).unwrap(), 1);
+            }
+        }
+        buf.cmd.wait().unwrap();
+    }
 }

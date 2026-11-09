@@ -54,26 +54,33 @@ pub fn find_card() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("VELLUM_DRM_DEVICE") {
         return Ok(PathBuf::from(path));
     }
-    let mut cards: Vec<String> = fs::read_dir("/sys/class/drm")
-        .context("reading /sys/class/drm")?
+    let cards = connected_cards(Path::new("/sys/class/drm"))?;
+    let card = cards
+        .first()
+        .ok_or_else(|| anyhow!("no DRM card with a connected display (set VELLUM_DRM_DEVICE)"))?;
+    Ok(Path::new("/dev/dri").join(card))
+}
+
+/// Names of cards ("card0", ...) with at least one connected connector,
+/// from a sysfs `class/drm` directory, ordered by card number.
+fn connected_cards(sysfs_drm: &Path) -> Result<Vec<String>> {
+    let card_number = |card: &str| card.strip_prefix("card")?.parse::<u32>().ok();
+    let mut cards: Vec<String> = fs::read_dir(sysfs_drm)
+        .with_context(|| format!("reading {}", sysfs_drm.display()))?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().into_string().ok()?;
             // Connector entries look like "card0-HDMI-A-1".
             let (card, _connector) = name.split_once('-')?;
-            if !card.starts_with("card") {
-                return None;
-            }
+            card_number(card)?;
             let status = fs::read_to_string(entry.path().join("status")).ok()?;
             (status.trim() == "connected").then(|| card.to_owned())
         })
         .collect();
-    cards.sort();
+    // Numeric, not lexicographic: card2 before card10.
+    cards.sort_by_key(|c| card_number(c));
     cards.dedup();
-    let card = cards
-        .first()
-        .ok_or_else(|| anyhow!("no DRM card with a connected display (set VELLUM_DRM_DEVICE)"))?;
-    Ok(Path::new("/dev/dri").join(card))
+    Ok(cards)
 }
 
 /// An object's properties by name: handle plus current raw value.
@@ -675,5 +682,216 @@ impl Drop for Display<'_> {
             Ok(()) => tracing::debug!("restored previous display state"),
             Err(e) => tracing::error!("failed to restore display state: {e:#}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gbm;
+    use crate::testutil::{self, TempDir};
+
+    // --- connected_cards -------------------------------------------------
+
+    fn connector(sysfs: &Path, name: &str, status: &str) {
+        let dir = sysfs.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("status"), format!("{status}\n")).unwrap();
+    }
+
+    #[test]
+    fn connected_cards_returns_cards_with_a_connected_connector() {
+        let sysfs = TempDir::new();
+        connector(sysfs.path(), "card0-DP-1", "disconnected");
+        connector(sysfs.path(), "card0-Writeback-1", "unknown");
+        connector(sysfs.path(), "card1-HDMI-A-1", "connected");
+        connector(sysfs.path(), "card1-DP-2", "connected");
+        assert_eq!(connected_cards(sysfs.path()).unwrap(), ["card1"]);
+    }
+
+    #[test]
+    fn connected_cards_sorts_by_card_number() {
+        let sysfs = TempDir::new();
+        connector(sysfs.path(), "card10-DP-1", "connected");
+        connector(sysfs.path(), "card2-DP-1", "connected");
+        connector(sysfs.path(), "card1-DP-1", "connected");
+        assert_eq!(
+            connected_cards(sysfs.path()).unwrap(),
+            ["card1", "card2", "card10"]
+        );
+    }
+
+    #[test]
+    fn connected_cards_ignores_non_connector_entries() {
+        let sysfs = TempDir::new();
+        // Nodes and files that live in /sys/class/drm alongside connectors.
+        fs::create_dir(sysfs.path().join("card0")).unwrap();
+        fs::create_dir(sysfs.path().join("renderD128")).unwrap();
+        fs::write(sysfs.path().join("version"), "drm 1.1.0\n").unwrap();
+        // Look like connectors but aren't cardN-*.
+        connector(sysfs.path(), "cardX-DP-1", "connected");
+        connector(sysfs.path(), "renderD128-foo", "connected");
+        // Connector without a status file.
+        fs::create_dir(sysfs.path().join("card3-DP-1")).unwrap();
+        assert!(connected_cards(sysfs.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn connected_cards_errors_on_missing_directory() {
+        let sysfs = TempDir::new();
+        assert!(connected_cards(&sysfs.path().join("nope")).is_err());
+    }
+
+    // --- parse_in_formats ------------------------------------------------
+
+    const XR24: u32 = DrmFourcc::Xrgb8888 as u32;
+    const AR24: u32 = DrmFourcc::Argb8888 as u32;
+    const NV12: u32 = DrmFourcc::Nv12 as u32;
+    const MOD_A: u64 = 0x0100_0000_0000_0001;
+    const MOD_B: u64 = 0x0200_0000_0000_0002;
+
+    /// Build a `drm_format_modifier_blob` the way the kernel lays it out.
+    /// `modifiers` entries are `(format mask, mask offset, modifier)`.
+    fn in_formats_blob(formats: &[u32], modifiers: &[(u64, u32, u64)]) -> Vec<u8> {
+        const HEADER: usize = 24;
+        let formats_offset = HEADER;
+        // The modifier array is 8-byte aligned.
+        let modifiers_offset = (formats_offset + 4 * formats.len()).next_multiple_of(8);
+        let mut blob = Vec::new();
+        for v in [
+            1, // version
+            0, // flags
+            formats.len() as u32,
+            formats_offset as u32,
+            modifiers.len() as u32,
+            modifiers_offset as u32,
+        ] {
+            blob.extend_from_slice(&u32::to_ne_bytes(v));
+        }
+        for f in formats {
+            blob.extend_from_slice(&f.to_ne_bytes());
+        }
+        blob.resize(modifiers_offset, 0);
+        for &(mask, offset, modifier) in modifiers {
+            blob.extend_from_slice(&mask.to_ne_bytes());
+            blob.extend_from_slice(&offset.to_ne_bytes());
+            blob.extend_from_slice(&0u32.to_ne_bytes()); // pad
+            blob.extend_from_slice(&modifier.to_ne_bytes());
+        }
+        blob
+    }
+
+    #[test]
+    fn in_formats_selects_modifiers_whose_mask_covers_the_format() {
+        let blob = in_formats_blob(
+            &[XR24, AR24, NV12],
+            &[
+                (0b011, 0, 0),     // LINEAR: XR24 + AR24
+                (0b010, 0, MOD_A), // AR24 only
+                (0b111, 0, MOD_B), // all three
+            ],
+        );
+        assert_eq!(parse_in_formats(&blob, XR24).unwrap(), [0, MOD_B]);
+        assert_eq!(parse_in_formats(&blob, AR24).unwrap(), [0, MOD_A, MOD_B]);
+        assert_eq!(parse_in_formats(&blob, NV12).unwrap(), [MOD_B]);
+    }
+
+    #[test]
+    fn in_formats_unlisted_format_has_no_modifiers() {
+        let blob = in_formats_blob(&[AR24], &[(0b1, 0, 0)]);
+        assert!(parse_in_formats(&blob, XR24).unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_formats_respects_mask_offset() {
+        // 70 formats; ours is at index 66, beyond the first 64-bit window.
+        let mut formats: Vec<u32> = (0..70).map(|i| 0x1000 + i).collect();
+        formats[66] = XR24;
+        let blob = in_formats_blob(
+            &formats,
+            &[
+                (u64::MAX, 0, MOD_A), // covers indices 0..64 only
+                (1 << 2, 64, MOD_B),  // bit 2 of window 64.. = index 66
+            ],
+        );
+        assert_eq!(parse_in_formats(&blob, XR24).unwrap(), [MOD_B]);
+    }
+
+    #[test]
+    fn in_formats_deduplicates_repeated_modifiers() {
+        // amdgpu lists LINEAR twice.
+        let blob = in_formats_blob(&[XR24], &[(1, 0, 0), (1, 0, MOD_A), (1, 0, 0)]);
+        assert_eq!(parse_in_formats(&blob, XR24).unwrap(), [0, MOD_A]);
+    }
+
+    #[test]
+    fn in_formats_rejects_truncated_blobs() {
+        let blob = in_formats_blob(&[XR24], &[(1, 0, MOD_A)]);
+        // Shorter than the header.
+        assert!(parse_in_formats(&blob[..16], XR24).is_err());
+        // Header intact, modifier array cut off.
+        assert!(parse_in_formats(&blob[..blob.len() - 4], XR24).is_err());
+    }
+
+    #[test]
+    fn in_formats_rejects_out_of_range_offsets() {
+        let mut blob = in_formats_blob(&[XR24], &[(1, 0, MOD_A)]);
+        // formats_offset far past the end.
+        blob[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(parse_in_formats(&blob, XR24).is_err());
+    }
+
+    // --- hardware --------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn select_output_finds_a_primary_plane_and_mode() {
+        let card = testutil::card();
+        let output = select_output(&card).unwrap();
+        assert_eq!(
+            output.plane_props.value("type"),
+            Some(DRM_PLANE_TYPE_PRIMARY)
+        );
+        let (w, h) = output.mode.size();
+        assert!(w > 0 && h > 0);
+        assert!(!output.connector_name.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn props_exposes_atomic_crtc_properties() {
+        let card = testutil::card();
+        let output = select_output(&card).unwrap();
+        let props = Props::load(&card, output.crtc).unwrap();
+        assert!(props.handle("ACTIVE").is_ok());
+        assert!(props.handle("MODE_ID").is_ok());
+        assert!(props.handle("NOT_A_PROPERTY").is_err());
+        assert_eq!(props.value("NOT_A_PROPERTY"), None);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn framebuffer_import_registers_and_removes_fb() {
+        let card = testutil::card();
+        let output = select_output(&card).unwrap();
+        let modifiers = plane_modifiers(&card, &output.plane_props, DrmFourcc::Xrgb8888).unwrap();
+        let gbm = gbm::Device::new(card.as_fd()).unwrap();
+        let bo = gbm
+            .create_bo(
+                256,
+                128,
+                DrmFourcc::Xrgb8888,
+                &modifiers,
+                gbm::BoFlags::SCANOUT,
+            )
+            .unwrap();
+        let dmabuf = bo.export().unwrap();
+
+        let fb = Framebuffer::import(&card, &dmabuf).unwrap();
+        let handle = fb.handle;
+        let info = card.get_framebuffer(handle).unwrap();
+        assert_eq!(info.size(), (256, 128));
+        drop(fb);
+        assert!(card.get_framebuffer(handle).is_err(), "RMFB on drop");
     }
 }

@@ -21,10 +21,11 @@
 //!
 //! Messages from libseat arrive through the `log` crate and are bridged in.
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal};
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -55,13 +56,13 @@ pub fn init() -> LogTargets {
         })
     });
 
-    let on_vt = stderr_is_vt();
+    let on_vt = is_vt(io::stderr());
     let console = on_vt
         .then(|| io::stderr().as_fd().try_clone_to_owned().ok())
         .flatten()
         .map(File::from);
 
-    let path = log_path();
+    let path = log_path(|key| std::env::var_os(key));
     let file = path
         .as_ref()
         .map(|p| open_log(p).map_err(|e| (p.clone(), e)));
@@ -114,29 +115,32 @@ pub fn init() -> LogTargets {
     LogTargets { file, console }
 }
 
-fn log_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("VELLUM_LOG_FILE") {
+/// The log file path, from environment variables looked up through `env`
+/// (a parameter so tests needn't touch the process environment).
+fn log_path(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(p) = env("VELLUM_LOG_FILE") {
         return Some(PathBuf::from(p));
     }
-    let state = std::env::var_os("XDG_STATE_HOME")
+    let state = env("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
     Some(state.join("vellum/vellum.log"))
 }
 
-fn open_log(path: &PathBuf) -> io::Result<File> {
+fn open_log(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut old = path.clone().into_os_string();
+    let mut old = path.to_path_buf().into_os_string();
     old.push(".old");
     // Fine if there's no previous log.
     let _ = fs::rename(path, old);
     File::create(path)
 }
 
-fn stderr_is_vt() -> bool {
-    let Ok(stat) = rustix::fs::fstat(io::stderr()) else {
+/// Whether `fd` is a virtual terminal (/dev/tty0../dev/tty63).
+fn is_vt(fd: impl AsFd) -> bool {
+    let Ok(stat) = rustix::fs::fstat(fd) else {
         return false;
     };
     let is_char = rustix::fs::FileType::from_raw_mode(stat.st_mode).is_char_device();
@@ -151,4 +155,87 @@ fn install_panic_hook() {
         let backtrace = std::backtrace::Backtrace::force_capture();
         tracing::error!("{info}\n{backtrace}");
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn log_path_prefers_explicit_file() {
+        let vars = [
+            ("VELLUM_LOG_FILE", "/x/custom.log"),
+            ("XDG_STATE_HOME", "/state"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(log_path(env(&vars)), Some("/x/custom.log".into()));
+    }
+
+    #[test]
+    fn log_path_uses_xdg_state_home() {
+        let vars = [("XDG_STATE_HOME", "/state"), ("HOME", "/home/u")];
+        assert_eq!(
+            log_path(env(&vars)),
+            Some("/state/vellum/vellum.log".into())
+        );
+    }
+
+    #[test]
+    fn log_path_falls_back_to_home() {
+        let vars = [("HOME", "/home/u")];
+        assert_eq!(
+            log_path(env(&vars)),
+            Some("/home/u/.local/state/vellum/vellum.log".into())
+        );
+    }
+
+    #[test]
+    fn log_path_none_without_any_variable() {
+        assert_eq!(log_path(env(&[])), None);
+    }
+
+    #[test]
+    fn open_log_creates_parent_directories() {
+        let tmp = TempDir::new();
+        let path = tmp.path().join("a/b/vellum.log");
+        open_log(&path).unwrap();
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn open_log_keeps_previous_run_as_old() {
+        let tmp = TempDir::new();
+        let path = tmp.path().join("vellum.log");
+        fs::write(&path, "previous run\n").unwrap();
+        fs::write(tmp.path().join("vellum.log.old"), "run before that\n").unwrap();
+
+        open_log(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("vellum.log.old")).unwrap(),
+            "previous run\n"
+        );
+    }
+
+    #[test]
+    fn pipes_and_other_char_devices_are_not_vts() {
+        let (read, write) = io::pipe().unwrap();
+        assert!(!is_vt(&read));
+        assert!(!is_vt(&write));
+        // /dev/null is a char device too (1:3), just not a tty.
+        let null = File::open("/dev/null").unwrap();
+        assert!(!is_vt(&null));
+        let tmp = TempDir::new();
+        let file = File::create(tmp.path().join("f")).unwrap();
+        assert!(!is_vt(&file));
+    }
 }
