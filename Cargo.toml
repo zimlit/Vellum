@@ -10,5 +10,6 @@ drm = "0.15"
 libc = "0.2"
 libseat = "0.2"
 rustix = { version = "1", features = ["event", "fs", "net", "process", "pty", "stdio", "termios"] }
+skrifa = "=0.49.0" # shares read-fonts 0.46 with harfrust 0.15 (step 9); upgrade together
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

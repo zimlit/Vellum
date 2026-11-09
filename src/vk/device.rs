@@ -20,6 +20,7 @@ pub struct Device {
     pub(super) physical: vk::PhysicalDevice,
     pub(super) queue: vk::Queue,
     pub(super) queue_family: u32,
+    pub(super) memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(super) memory_fd: khr::external_memory_fd::Device,
     pub(super) semaphore_fd: khr::external_semaphore_fd::Device,
     pub(super) instance: Arc<Instance>,
@@ -96,19 +97,25 @@ impl Device {
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
         let extensions: Vec<*const c_char> = DEVICE_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
-        // Both are mandatory in Vulkan 1.3.
+        // All mandatory in Vulkan 1.3. Buffer device addresses let shaders
+        // take buffers as 64-bit pointers in push constants, so buffers
+        // need no descriptors.
+        let mut features12 =
+            vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
             .dynamic_rendering(true);
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
+            .push_next(&mut features12)
             .push_next(&mut features13);
 
         // SAFETY: physical belongs to inst; info references live locals.
         let raw = unsafe { inst.create_device(physical, &info, None) }
             .with_context(|| format!("vkCreateDevice on {name}"))?;
         let queue = unsafe { raw.get_device_queue(queue_family, 0) };
+        let memory_properties = unsafe { inst.get_physical_device_memory_properties(physical) };
 
         Ok(Arc::new(Self {
             memory_fd: khr::external_memory_fd::Device::new(inst, &raw),
@@ -117,6 +124,7 @@ impl Device {
             physical,
             queue,
             queue_family,
+            memory_properties,
             instance: instance.clone(),
             name,
         }))

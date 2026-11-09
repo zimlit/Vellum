@@ -1,0 +1,14 @@
+// Test: write a gradient into storage image 0 (set 0, binding 0).
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(p, imageSize(target)))) {
+        // Exactly representable in 8 bits: p / 255.
+        imageStore(target, p, vec4(float(p.x) / 255.0, float(p.y) / 255.0, 0.0, 1.0));
+    }
+}

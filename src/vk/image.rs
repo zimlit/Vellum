@@ -6,6 +6,7 @@ use ash::vk;
 use drm::buffer::DrmFourcc;
 
 use super::Device;
+use super::memory::{Dedicated, Location, Memory};
 use crate::dmabuf::DmaBuf;
 
 /// The Vulkan format with the same memory layout as a DRM fourcc. DRM
@@ -245,6 +246,116 @@ impl DmaBufImage {
             unsafe { dev.create_image_view(&view_info, None) }.context("vkCreateImageView")?;
 
         Ok(Arc::new(this))
+    }
+}
+
+/// A 2D image in its own device-local memory (atlas, offscreen targets).
+pub struct Image {
+    pub(super) image: vk::Image,
+    pub(super) view: vk::ImageView,
+    pub(super) extent: vk::Extent2D,
+    format: vk::Format,
+    /// Freed after Drop::drop has destroyed the image and view.
+    memory: Option<Memory>,
+    device: Arc<Device>,
+}
+
+impl Image {
+    /// An optimally tiled image, initially in `UNDEFINED` layout.
+    pub fn new(
+        device: &Arc<Device>,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Arc<Self>> {
+        let dev = &device.raw;
+        let extent = vk::Extent2D { width, height };
+        let mut this = Self {
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            extent,
+            format,
+            memory: None,
+            device: device.clone(),
+        };
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        this.image = unsafe { dev.create_image(&info, None) }
+            .with_context(|| format!("vkCreateImage ({width}x{height} {format:?})"))?;
+        let reqs = unsafe { dev.get_image_memory_requirements(this.image) };
+        let memory = Memory::allocate(
+            device,
+            reqs,
+            Location::Device,
+            Dedicated::Image(this.image),
+            false,
+        )?;
+        unsafe { dev.bind_image_memory(this.image, memory.raw, 0) }.context("vkBindImageMemory")?;
+        this.memory = Some(memory);
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(this.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(COLOR_RANGE);
+        this.view =
+            unsafe { dev.create_image_view(&view_info, None) }.context("vkCreateImageView")?;
+        Ok(Arc::new(this))
+    }
+
+    pub fn width(&self) -> u32 {
+        self.extent.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.extent.height
+    }
+
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        // SAFETY: command buffers keep an Arc while in flight. Null handles
+        // (partly built image) are valid to destroy. `memory` drops after.
+        unsafe {
+            let dev = &self.device.raw;
+            dev.destroy_image_view(self.view, None);
+            dev.destroy_image(self.image, None);
+        }
+    }
+}
+
+/// An image that can be rendered into with [`super::Recorder::begin_rendering`].
+pub trait RenderTarget: Send + Sync + 'static {
+    #[doc(hidden)]
+    fn view_and_extent(&self) -> (vk::ImageView, vk::Extent2D);
+}
+
+impl RenderTarget for Image {
+    fn view_and_extent(&self) -> (vk::ImageView, vk::Extent2D) {
+        (self.view, self.extent)
+    }
+}
+
+impl RenderTarget for DmaBufImage {
+    fn view_and_extent(&self) -> (vk::ImageView, vk::Extent2D) {
+        (self.view, self.extent)
     }
 }
 

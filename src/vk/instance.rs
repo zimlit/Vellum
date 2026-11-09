@@ -125,6 +125,14 @@ impl Drop for Instance {
     }
 }
 
+/// Validation errors reported so far, process-wide. Tests fail on any.
+static VALIDATION_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn validation_errors() -> usize {
+    VALIDATION_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     types: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -153,6 +161,9 @@ unsafe extern "system" fn debug_callback(
     };
 
     if severity.contains(Severity::ERROR) {
+        VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        eprintln!("vulkan validation error: {id}: {message}");
         tracing::error!(target: "vulkan", ?types, %id, "{message}");
     } else if severity.contains(Severity::WARNING) {
         tracing::warn!(target: "vulkan", ?types, %id, "{message}");

@@ -145,7 +145,7 @@ pub fn render(buf: &mut Buffer, start: Instant) -> Result<Option<OwnedFd>> {
     let color = animated_color(start.elapsed());
     let mut rec = buf.cmd.begin()?;
     rec.acquire_from_foreign(&buf.image);
-    rec.clear(&buf.image, color);
+    rec.clear(&buf.image, color)?;
     rec.release_to_foreign(&buf.image);
     rec.submit(Some(&buf.rendered))?;
     buf.rendered.export_sync_file()

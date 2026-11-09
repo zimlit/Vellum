@@ -31,18 +31,20 @@ Language: **Rust** (all crate choices below assume it).
 
 | Area | Choice | Notes |
 |---|---|---|
-| GPU API | **Vulkan via `ash`** | Chosen over wgpu for control over display timing and VT handling. `gpu-allocator` for memory. Performance would be equal for a terminal either way; the reason is control. |
+| GPU API | **Vulkan via `ash`** | Chosen over wgpu for control over display timing and VT handling. Performance would be equal for a terminal either way; the reason is control. All `unsafe` Vulkan lives in a safe wrapper (`src/vk/`). |
+| GPU memory | **Own small allocator** | Few, long-lived allocations: choose the memory type ourselves, one dedicated allocation per resource, persistent mapping for upload buffers. Revisit (suballocation) if counts grow, e.g. with Wayland clients. |
+| Shaders | **GLSL → SPIR-V with `glslc`** in `build.rs` | Needs shaderc (`glslc`) at build time. |
 | Display | **Own KMS, atomic modesetting** (libdrm / `drm` crate) | Do NOT use `VK_KHR_display` / `VK_EXT_acquire_drm_display`: it gives KMS control to the driver, VT switching is poorly tested, and driver support varies. |
 | Render targets | GBM-allocated (or Vulkan `VK_EXT_image_drm_format_modifier`) **dma-bufs**, imported into Vulkan with `VK_EXT_external_memory_dma_buf`, registered with `drmModeAddFB2WithModifiers` | The same import path is reused later for Wayland client buffers. |
 | Input | `libinput` (`input` crate) + `xkbcommon` | evdev gives physical keycodes; xkbcommon turns them into keysyms and UTF-8. |
 | Session / VT | **libseat** (logind or seatd) | Lets it run without root; handles DRM master, device open/revoke and VT switching. |
-| Font discovery | **system fontconfig** | Also read per-font settings: `hintstyle`, `antialias`, `rgba`, `lcdfilter`. |
+| Font discovery | **system fontconfig**, own FFI bindings | Also read per-font settings: `hintstyle`, `antialias`, `rgba`, `lcdfilter`. Hand-written bindings like `gbm.rs`. |
 | Shaping | **HarfRust** | HarfBuzz's official Rust port, built on `read-fonts`. Preferred over swash's shaper, which covers less. |
 | Outlines / hinting | **skrifa** (fontations) | FreeType-quality hinted outlines (TrueType bytecode, CFF, autohinter). It does NOT rasterize. |
 | Rasterization | **Own, as a GPU compute shader** | See "Glyph rasterizer" below. |
 | Terminal core | Undecided: write own parser vs `vte` crate / libvterm | Reference: Paul Williams' DEC/VT500 parser state machine (vt100.net). |
 
-**Dependency warning:** HarfRust, skrifa and read-fonts often make breaking changes in *minor* releases by bumping `read-fonts`. Pin all three to versions that share one `read-fonts`, and check `cargo tree -d` after every upgrade.
+**Dependency warning:** HarfRust, skrifa and read-fonts often make breaking changes in *minor* releases by bumping `read-fonts`. Pin all three to versions that share one `read-fonts`, and check `cargo tree -d` after every upgrade. Currently skrifa `=0.49.0`, which matches harfrust 0.15 (read-fonts 0.46).
 
 ## Text pipeline design
 
@@ -95,7 +97,7 @@ Notes:
 
 - **Validation layers plus synchronization validation always on** in debug builds.
 - Sync and image-layout mistakes are the expected class of bugs; be explicit and conservative with barriers first, then optimize.
-- Shaders: WGSL is not native to Vulkan. Write GLSL or Slang and compile to SPIR-V, or compile WGSL to SPIR-V with naga at build time.
+- Shaders are GLSL in `shaders/`, compiled to SPIR-V by `build.rs` with `glslc` and embedded in the binary.
 
 ## Planned: embedded Wayland compositor (after the terminal works)
 
@@ -115,14 +117,13 @@ Notes:
 1. **KMS bring-up:** open the device via libseat, find connector/mode/CRTC/plane, allocate dma-buf, atomic commit of a solid color, clean restore on exit.
 2. **Vulkan bring-up:** instance/device with dma-buf import, render a clear color into the imported image, page-flip with fences.
 3. **PTY:** `forkpty`/`openpty` into the session process; one `poll`/epoll loop over PTY, libinput, DRM and signalfd fds.
-4. **Text v0:** fontconfig + skrifa + CPU rasterizing (temporary) into the atlas; instanced cell renderer; raw shell output.
+4. **Text v0:** fontconfig + skrifa outlines + the **GPU compute rasterizer** (see "Glyph rasterizer"; no temporary CPU rasterizer) into the atlas; instanced cell renderer; raw shell output. Validate the rasterizer against a CPU reference of the same algorithm in tests, and later by diffing against FreeType/swash output for the same font, size and hinting.
 5. **Terminal core:** VT parser, grid, scrollback, alternate screen, SGR attributes.
 6. **Input:** libinput + xkbcommon, key → escape-sequence encoding.
 7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Until then vellum exits cleanly when its session is disabled.
-8. **GPU compute rasterizer** replaces the CPU one; validate by diffing against FreeType/swash output for the same font, size and hinting.
-9. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
-10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).
-11. Embedded Wayland compositor (see above).
+8. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
+9. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).
+10. Embedded Wayland compositor (see above).
 
 ## References
 
