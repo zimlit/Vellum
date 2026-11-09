@@ -16,13 +16,12 @@ mod sync;
 
 pub use ash::vk::ImageUsageFlags;
 pub use command::CommandBuffer;
+pub use command::Recorder;
 pub use device::Device;
 pub use image::DmaBufImage;
+pub use image::Modifier;
 pub use instance::Instance;
 pub use sync::Semaphore;
-// Returned by public methods; exported so callers can name them.
-#[allow(unused_imports)]
-pub use {command::Recorder, image::Modifier};
 
 /// Tests needing a real GPU. Pure helpers are tested next to their code.
 #[cfg(test)]

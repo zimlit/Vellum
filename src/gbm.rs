@@ -73,7 +73,6 @@ impl BoFlags {
     /// Buffer will be a GPU render target.
     pub const RENDERING: Self = Self(1 << 2);
     /// Force a linear layout. Not allowed together with an explicit modifier list.
-    #[allow(dead_code)]
     pub const LINEAR: Self = Self(1 << 4);
 }
 
