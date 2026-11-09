@@ -17,6 +17,8 @@
 //!   builds.
 //! - `VELLUM_LOG_FILE`: log file path. Default
 //!   `$XDG_STATE_HOME/vellum/vellum.log` (`~/.local/state/vellum/vellum.log`).
+//! - `VELLUM_SESSION_LOG_FILE`: the same for the PTY session server, which
+//!   logs to `session.log` next to it by default.
 //!   The previous run's log is kept as `<file>.old`.
 //!
 //! Messages from libseat arrive through the `log` crate and are bridged in.
@@ -35,6 +37,25 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// Linux TTY_MAJOR: /dev/tty0../dev/tty63 (VTs) are char devices 4:0..4:63.
 const TTY_MAJOR: u32 = 4;
 
+/// Which process is logging, and so which file it logs to.
+#[derive(Clone, Copy)]
+pub struct LogFile {
+    /// Environment variable overriding the path.
+    pub env_var: &'static str,
+    /// File name in the default directory.
+    pub name: &'static str,
+}
+
+pub const FRONT_END: LogFile = LogFile {
+    env_var: "VELLUM_LOG_FILE",
+    name: "vellum.log",
+};
+
+pub const SESSION_SERVER: LogFile = LogFile {
+    env_var: "VELLUM_SESSION_LOG_FILE",
+    name: "session.log",
+};
+
 /// Where logs are going.
 pub struct LogTargets {
     /// The log file, if one could be opened.
@@ -47,7 +68,7 @@ pub struct LogTargets {
 
 /// Install the global subscriber and panic hook. Problems opening the log
 /// file are logged (to stderr, if that is usable) rather than fatal.
-pub fn init() -> LogTargets {
+pub fn init(which: LogFile) -> LogTargets {
     let filter = EnvFilter::try_from_env("VELLUM_LOG").unwrap_or_else(|_| {
         EnvFilter::new(if cfg!(debug_assertions) {
             "info,vellum=debug"
@@ -62,7 +83,7 @@ pub fn init() -> LogTargets {
         .flatten()
         .map(File::from);
 
-    let path = log_path(|key| std::env::var_os(key));
+    let path = log_path(which, |key| std::env::var_os(key));
     let file = path
         .as_ref()
         .map(|p| open_log(p).map_err(|e| (p.clone(), e)));
@@ -104,7 +125,10 @@ pub fn init() -> LogTargets {
             None
         }
         (None, None) => {
-            tracing::warn!("no log file: neither VELLUM_LOG_FILE, XDG_STATE_HOME nor HOME is set");
+            tracing::warn!(
+                "no log file: neither {}, XDG_STATE_HOME nor HOME is set",
+                which.env_var
+            );
             None
         }
         (None, Some(path)) => Some(path),
@@ -117,14 +141,14 @@ pub fn init() -> LogTargets {
 
 /// The log file path, from environment variables looked up through `env`
 /// (a parameter so tests needn't touch the process environment).
-fn log_path(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if let Some(p) = env("VELLUM_LOG_FILE") {
+fn log_path(which: LogFile, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(p) = env(which.env_var) {
         return Some(PathBuf::from(p));
     }
     let state = env("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(state.join("vellum/vellum.log"))
+    Some(state.join("vellum").join(which.name))
 }
 
 fn open_log(path: &Path) -> io::Result<File> {
@@ -177,14 +201,17 @@ mod tests {
             ("XDG_STATE_HOME", "/state"),
             ("HOME", "/home/u"),
         ];
-        assert_eq!(log_path(env(&vars)), Some("/x/custom.log".into()));
+        assert_eq!(
+            log_path(FRONT_END, env(&vars)),
+            Some("/x/custom.log".into())
+        );
     }
 
     #[test]
     fn log_path_uses_xdg_state_home() {
         let vars = [("XDG_STATE_HOME", "/state"), ("HOME", "/home/u")];
         assert_eq!(
-            log_path(env(&vars)),
+            log_path(FRONT_END, env(&vars)),
             Some("/state/vellum/vellum.log".into())
         );
     }
@@ -193,14 +220,28 @@ mod tests {
     fn log_path_falls_back_to_home() {
         let vars = [("HOME", "/home/u")];
         assert_eq!(
-            log_path(env(&vars)),
+            log_path(FRONT_END, env(&vars)),
             Some("/home/u/.local/state/vellum/vellum.log".into())
         );
     }
 
     #[test]
+    fn session_server_has_its_own_file() {
+        let vars = [("VELLUM_LOG_FILE", "/x/custom.log"), ("HOME", "/home/u")];
+        assert_eq!(
+            log_path(SESSION_SERVER, env(&vars)),
+            Some("/home/u/.local/state/vellum/session.log".into())
+        );
+        let vars = [("VELLUM_SESSION_LOG_FILE", "/x/s.log")];
+        assert_eq!(
+            log_path(SESSION_SERVER, env(&vars)),
+            Some("/x/s.log".into())
+        );
+    }
+
+    #[test]
     fn log_path_none_without_any_variable() {
-        assert_eq!(log_path(env(&[])), None);
+        assert_eq!(log_path(FRONT_END, env(&[])), None);
     }
 
     #[test]

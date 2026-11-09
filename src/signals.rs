@@ -67,6 +67,24 @@ impl AsFd for SignalFd {
     }
 }
 
+/// Unblock every signal for the calling thread.
+///
+/// For child processes between fork and exec: the blocked mask survives
+/// exec, so without this a shell started by vellum would never see the
+/// signals blocked for [`SignalFd`] (^C included). Only async-signal-safe
+/// calls.
+pub fn unblock_all() -> io::Result<()> {
+    // SAFETY: plain libc calls on a locally owned sigset.
+    unsafe {
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        if libc::sigprocmask(libc::SIG_SETMASK, set.as_ptr(), ptr::null_mut()) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub fn name(sig: c_int) -> &'static str {
     match sig {
         libc::SIGINT => "SIGINT",

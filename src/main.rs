@@ -1,4 +1,4 @@
-//! Roadmap steps 1–2: KMS + Vulkan bring-up.
+//! Roadmap steps 1–3: KMS + Vulkan bring-up, and a shell on a PTY.
 //!
 //! Open the DRM device through libseat, pick a connector/mode/CRTC/primary
 //! plane, and allocate two scanout buffers with GBM using a format modifier
@@ -10,15 +10,25 @@
 //! restored on exit (normal return, error, panic unwind, or a termination
 //! signal).
 //!
+//! The shell runs in the PTY session server (see `server`), which is started
+//! on demand; vellum attaches to it and gets the PTY master. Until text
+//! rendering exists (step 4) the shell's output only goes to the log.
+//!
 //! Usage: vellum [--probe] [--seconds N]
 //!   --probe      open the card directly (no seat, no DRM master), render one
 //!                frame without showing it, and print what was chosen
 //!   --seconds N  how long to run; 0 = until a signal (default 10)
+//!
+//! Internal: `vellum --session-server PATH` is the session server, started
+//! by vellum itself with the listening socket on fd 3.
 
 mod dmabuf;
+mod event;
 mod gbm;
 mod kms;
 mod logging;
+mod pty;
+mod server;
 mod session;
 mod signals;
 #[cfg(test)]
@@ -26,6 +36,7 @@ mod testutil;
 mod vk;
 
 use std::os::fd::{AsFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,8 +44,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use drm::buffer::DrmFourcc;
 use drm::{ClientCapability, Device as DrmDevice, DriverCapability};
-use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
 
+use crate::event::Poller;
 use crate::kms::{Card, Framebuffer, Output};
 use crate::session::Session;
 use crate::signals::SignalFd;
@@ -42,10 +54,20 @@ use crate::signals::SignalFd;
 const FORMAT: DrmFourcc = DrmFourcc::Xrgb8888;
 const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
 const BUFFER_COUNT: usize = 2;
+/// Cell size used for the PTY's size until there is a font (step 4).
+const PLACEHOLDER_CELL: (u16, u16) = (8, 16);
+
+// Event loop tokens.
+const SEAT: u64 = 0;
+const SIGNALS: u64 = 1;
+const CARD: u64 = 2;
+const PTY: u64 = 3;
 
 struct Args {
     probe: bool,
     seconds: u64,
+    /// Run as the PTY session server on this socket.
+    session_server: Option<PathBuf>,
 }
 
 impl Args {
@@ -58,6 +80,7 @@ impl Args {
         let mut args = Args {
             probe: false,
             seconds: 10,
+            session_server: None,
         };
         let mut it = it.into_iter();
         while let Some(arg) = it.next() {
@@ -66,6 +89,10 @@ impl Args {
                 "--seconds" => {
                     let n = it.next().context("--seconds needs a value")?;
                     args.seconds = n.parse().context("--seconds expects an integer")?;
+                }
+                "--session-server" => {
+                    let path = it.next().context("--session-server needs a socket path")?;
+                    args.session_server = Some(path.into());
                 }
                 other => bail!("unknown argument {other:?}"),
             }
@@ -87,13 +114,31 @@ struct Buffer<'a> {
 }
 
 fn main() -> ExitCode {
-    let mut log = logging::init();
+    let args = match Args::parse() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("vellum: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(path) = args.session_server {
+        logging::init(logging::SESSION_SERVER);
+        return match server::main(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("{e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let mut log = logging::init(logging::FRONT_END);
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         log_file = ?log.file,
         "starting"
     );
-    match run() {
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
@@ -112,8 +157,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let args = Args::parse()?;
+fn run(args: Args) -> Result<()> {
     // Before any threads exist, so they all inherit the blocked mask.
     let signals = SignalFd::new(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT])
         .context("setting up signalfd")?;
@@ -128,6 +172,27 @@ fn run() -> Result<()> {
     let mut session = Session::open()?;
     let card = Card::new(session.open_device(&path)?);
     let output = prepare(&card)?;
+
+    let (w, h) = output.mode.size();
+    let size = pty::WinSize {
+        cols: w / PLACEHOLDER_CELL.0,
+        rows: h / PLACEHOLDER_CELL.1,
+        width: w,
+        height: h,
+    };
+    let socket = server::socket_path()?;
+    let shell = server::attach(&socket, size)?;
+    rustix::fs::fcntl_setfl(&shell.master, rustix::fs::OFlags::NONBLOCK)
+        .context("making the PTY non-blocking")?;
+    // Reattaching to a running shell: make sure it has our size.
+    pty::set_size(&shell.master, size).context("setting the PTY size")?;
+    tracing::info!(
+        pid = shell.pid,
+        new = shell.spawned,
+        size = %format_args!("{}x{}", size.cols, size.rows),
+        "attached to shell"
+    );
+
     let instance = vk::Instance::new(cfg!(debug_assertions))?;
     let device = vulkan_device(&instance, &card)?;
     let gbm = gbm::Device::new(card.as_fd()).context("gbm_create_device")?;
@@ -165,57 +230,65 @@ fn run() -> Result<()> {
     queue_frame(&mut display, &mut buffers[queued], start)?;
     let mut flips = 0u64;
 
+    let mut poller = Poller::new().context("creating epoll instance")?;
+    poller.add(session.fd(), SEAT)?;
+    poller.add(&signals, SIGNALS)?;
+    poller.add(&card, CARD)?;
+    poller.add(&shell.master, PTY)?;
+    let mut ready = Vec::new();
+    let mut pty_buf = vec![0u8; 64 * 1024];
+    let mut shell_alive = true;
+
     let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
-    loop {
+    'events: loop {
         let timeout = match deadline {
             Some(d) => {
                 let left = d.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
                 }
-                Some(Timespec {
-                    tv_sec: left.as_secs() as _,
-                    tv_nsec: left.subsec_nanos() as _,
-                })
+                Some(left)
             }
             None => None,
         };
+        poller.wait(timeout, &mut ready).context("epoll_wait")?;
 
-        let (seat_ready, signal_ready, card_ready) = {
-            let seat_fd = session.fd();
-            let mut fds = [
-                PollFd::new(&seat_fd, PollFlags::IN),
-                PollFd::new(&signals, PollFlags::IN),
-                PollFd::new(&card, PollFlags::IN),
-            ];
-            match rustix::event::poll(&mut fds, timeout.as_ref()) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(e).context("poll"),
+        for &token in &ready {
+            match token {
+                SIGNALS => {
+                    if let Some(sig) = signals.read()? {
+                        tracing::info!(signal = signals::name(sig), "exiting on signal");
+                        break 'events;
+                    }
+                }
+                SEAT => {
+                    session.dispatch()?;
+                    if !session.active() {
+                        // VT switching proper is roadmap step 7; for now just leave.
+                        tracing::info!("session disabled (VT switched away), exiting");
+                        break 'events;
+                    }
+                }
+                CARD => {
+                    if display.dispatch_events()? {
+                        // `queued` is on screen now, so the previously shown
+                        // buffer is no longer scanned out and can be
+                        // rendered into.
+                        flips += 1;
+                        (shown, queued) = (queued, shown);
+                        tracing::trace!(flips, shown, "page flip completed");
+                        queue_frame(&mut display, &mut buffers[queued], start)?;
+                    }
+                }
+                PTY => {
+                    if !read_pty(&shell.master, &mut pty_buf)? {
+                        tracing::info!("shell exited");
+                        shell_alive = false;
+                        break 'events;
+                    }
+                }
+                _ => unreachable!("unknown event token {token}"),
             }
-            let ready = |i: usize| !fds[i].revents().is_empty();
-            (ready(0), ready(1), ready(2))
-        };
-
-        if signal_ready && let Some(sig) = signals.read()? {
-            tracing::info!(signal = signals::name(sig), "exiting on signal");
-            break;
-        }
-        if seat_ready {
-            session.dispatch()?;
-            if !session.active() {
-                // VT switching proper is roadmap step 7; for now just leave.
-                tracing::info!("session disabled (VT switched away), exiting");
-                break;
-            }
-        }
-        if card_ready && display.dispatch_events()? {
-            // `queued` is on screen now, so the previously shown buffer is
-            // no longer scanned out and can be rendered into.
-            flips += 1;
-            (shown, queued) = (queued, shown);
-            tracing::trace!(flips, shown, "page flip completed");
-            queue_frame(&mut display, &mut buffers[queued], start)?;
         }
     }
 
@@ -226,7 +299,29 @@ fn run() -> Result<()> {
         rate_hz = %format_args!("{:.1}", flips as f64 / secs),
         "shutting down"
     );
+    // Only an orderly exit ends the shell; after a crash (error return,
+    // panic) it keeps running in the session server for the next attach.
+    if shell_alive && let Err(e) = shell.close() {
+        tracing::warn!("asking the session server to close the shell: {e}");
+    }
     Ok(())
+}
+
+/// Read what the shell wrote. Until text rendering (step 4) it only goes to
+/// the log. Returns false once the shell is gone.
+fn read_pty(master: &OwnedFd, buf: &mut [u8]) -> Result<bool> {
+    match rustix::io::read(master, &mut *buf) {
+        // EIO: every slave fd is closed, i.e. the shell (and anything else
+        // using the terminal) has exited.
+        Ok(0) | Err(Errno::IO) => Ok(false),
+        Ok(n) => {
+            tracing::debug!(bytes = n, "shell output");
+            tracing::trace!(target: "vellum::pty", "{}", buf[..n].escape_ascii());
+            Ok(true)
+        }
+        Err(Errno::AGAIN | Errno::INTR) => Ok(true),
+        Err(e) => Err(e).context("reading the PTY"),
+    }
 }
 
 /// Enable atomic modesetting and choose the output.
@@ -399,6 +494,8 @@ fn probe(card: &Card) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::event::{PollFd, PollFlags, Timespec};
+
     use crate::testutil;
 
     fn args(list: &[&str]) -> Result<Args> {
@@ -410,6 +507,7 @@ mod tests {
         let a = args(&[]).unwrap();
         assert!(!a.probe);
         assert_eq!(a.seconds, 10);
+        assert_eq!(a.session_server, None);
     }
 
     #[test]
@@ -425,6 +523,13 @@ mod tests {
         assert!(args(&["--seconds", "ten"]).is_err(), "not a number");
         assert!(args(&["--seconds", "-1"]).is_err(), "negative");
         assert!(args(&["--bogus"]).is_err(), "unknown flag");
+        assert!(args(&["--session-server"]).is_err(), "missing path");
+    }
+
+    #[test]
+    fn args_session_server() {
+        let a = args(&["--session-server", "/run/s.sock"]).unwrap();
+        assert_eq!(a.session_server, Some("/run/s.sock".into()));
     }
 
     #[test]
