@@ -750,7 +750,7 @@ mod tests {
         std::thread::spawn(move || {
             let command = Box::new(|| {
                 let mut cmd = Command::new("/bin/sh");
-                cmd.env("PS1", "$ ").env("TERM", pty::TERM);
+                pty::terminal_env(&mut cmd).env("PS1", "$ ");
                 cmd
             });
             let result =

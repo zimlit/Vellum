@@ -21,9 +21,46 @@ use rustix::termios::{self, tcsetwinsize};
 
 use crate::signals;
 
-/// `$TERM` for programs in the terminal. This is the emulation vellum aims
-/// for; until the terminal core (roadmap step 5) exists nothing interprets it.
+/// `$TERM` for programs in the terminal: the emulation the terminal core
+/// (`crate::term`) follows.
 pub const TERM: &str = "xterm-256color";
+
+/// `$COLORTERM`: SGR 38/48 with RGB colors work (terminfo can't say so).
+pub const COLORTERM: &str = "truecolor";
+
+/// Variables other terminals set to identify themselves. They're inherited
+/// when vellum is started from inside one (e.g. over SSH with `SendEnv`),
+/// and would make programs expect that terminal's features.
+const OTHER_TERMINALS: &[&str] = &[
+    "VTE_VERSION",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_PUBLIC_KEY",
+    "WEZTERM_PANE",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "GHOSTTY_RESOURCES_DIR",
+    "WT_SESSION",
+    "TERMINAL_EMULATOR",
+    "TERM_SESSION_ID",
+];
+
+/// Set the environment that describes vellum to programs in it: `TERM`,
+/// `COLORTERM`, `TERM_PROGRAM` and `TERM_PROGRAM_VERSION`, and remove what
+/// another terminal may have left there.
+pub fn terminal_env(cmd: &mut Command) -> &mut Command {
+    for var in OTHER_TERMINALS {
+        cmd.env_remove(var);
+    }
+    cmd.env("TERM", TERM)
+        .env("COLORTERM", COLORTERM)
+        .env("TERM_PROGRAM", "vellum")
+        .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+}
 
 /// Terminal size in cells and in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,13 +136,13 @@ pub fn spawn(mut cmd: Command, size: WinSize) -> io::Result<Spawned> {
     Ok(Spawned { master, child })
 }
 
-/// The user's shell (`$SHELL`, else `/bin/sh`) with `TERM` set.
+/// The user's shell (`$SHELL`, else `/bin/sh`) with the [`terminal_env`].
 pub fn shell_command() -> Command {
     let shell = std::env::var_os("SHELL")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut cmd = Command::new(shell);
-    cmd.env("TERM", TERM);
+    terminal_env(&mut cmd);
     cmd
 }
 
@@ -163,7 +200,7 @@ pub mod tests {
 
     fn run(script: &str) -> String {
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(script).env("TERM", TERM);
+        terminal_env(cmd.arg("-c").arg(script));
         let mut spawned = spawn(cmd, SIZE).unwrap();
         let (out, hung_up) = read_until(&spawned.master, Duration::from_secs(10), |_| false);
         assert!(
@@ -219,11 +256,21 @@ pub mod tests {
     }
 
     #[test]
-    fn shell_command_sets_term() {
+    fn shell_command_describes_vellum() {
         let cmd = shell_command();
-        assert!(
-            cmd.get_envs()
-                .any(|(k, v)| k == "TERM" && v == Some(TERM.as_ref()))
-        );
+        let envs: Vec<_> = cmd.get_envs().collect();
+        let has = |k: &str, v: &str| envs.contains(&(k.as_ref(), Some(v.as_ref())));
+        assert!(has("TERM", TERM));
+        assert!(has("COLORTERM", COLORTERM));
+        assert!(has("TERM_PROGRAM", "vellum"));
+        // Another terminal's markers are removed (None: unset).
+        assert!(envs.contains(&("VTE_VERSION".as_ref(), None)));
+    }
+
+    #[test]
+    fn child_environment() {
+        // VTE_VERSION is unset even when the tests run inside a VTE terminal.
+        let out = run("echo \"$TERM $COLORTERM $TERM_PROGRAM ${VTE_VERSION-unset}\"");
+        assert_eq!(out, "xterm-256color truecolor vellum unset\r\n");
     }
 }

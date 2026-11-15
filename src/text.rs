@@ -1,4 +1,4 @@
-//! Drawing the grid: glyph cache, atlas, and the instanced cell pass.
+//! Drawing the terminal's screen: glyph cache, atlas, and the instanced cell pass.
 //!
 //! Each frame builds one instance per non-empty cell (plus the cursor),
 //! rasterizes glyphs not seen before into the atlas (compute, before the
@@ -14,9 +14,9 @@ use anyhow::{Context, Result};
 use skrifa::GlyphId;
 
 use crate::font::{CellMetrics, Font};
-use crate::grid::Grid;
 use crate::raster::{AtlasFull, Rasterizer, Rect};
 use crate::spirv;
+use crate::term::Terminal;
 use crate::vk::{
     self, Blend, Buffer, BufferUsageFlags, DescriptorSet, Device, GraphicsPipeline, Layout,
     Location, Pod, Recorder, RenderTarget,
@@ -147,16 +147,17 @@ impl TextRenderer {
         self.font.cell()
     }
 
-    /// Record a frame of `grid` into `target`, using instance buffer `slot`.
+    /// Record a frame of `term`'s screen into `target`, using instance
+    /// buffer `slot`.
     pub fn draw<T: RenderTarget>(
         &mut self,
         rec: &mut Recorder,
         target: &Arc<T>,
         slot: usize,
-        grid: &Grid,
+        term: &Terminal,
         colors: &Colors,
     ) -> Result<()> {
-        if let Err(e) = self.build(grid, colors) {
+        if let Err(e) = self.build(term, colors) {
             if e.downcast_ref::<AtlasFull>().is_none() {
                 return Err(e);
             }
@@ -164,7 +165,7 @@ impl TextRenderer {
             tracing::debug!(glyphs = self.cache.len(), "glyph atlas full; clearing it");
             self.raster.clear();
             self.cache.clear();
-            self.build(grid, colors)
+            self.build(term, colors)
                 .context("the glyphs on screen don't fit in the atlas")?;
         }
         self.raster.record(rec)?;
@@ -180,7 +181,7 @@ impl TextRenderer {
             instances: buffer.address(),
             screen: [width, height],
             cell: [cell.width, cell.height],
-            origin: grid_origin(cell, grid, width, height),
+            origin: grid_origin(cell, term, width, height),
         };
         rec.begin_rendering(target, Some(colors.background))?;
         if count > 0 {
@@ -189,14 +190,14 @@ impl TextRenderer {
         rec.end_rendering()
     }
 
-    /// Fill `self.instances` for `grid`, queueing new glyphs. Fails with
+    /// Fill `self.instances` for `term`, queueing new glyphs. Fails with
     /// [`AtlasFull`] (inside the anyhow error) when the atlas runs out.
-    fn build(&mut self, grid: &Grid, colors: &Colors) -> Result<()> {
+    fn build(&mut self, term: &Terminal, colors: &Colors) -> Result<()> {
         self.instances.clear();
         let fg = pack_color(colors.foreground);
-        for row in 0..grid.rows() {
-            for col in 0..grid.cols() {
-                let ch = grid.cell(col, row);
+        for row in 0..term.rows() {
+            for col in 0..term.cols() {
+                let ch = term.cell(col, row).ch;
                 if ch == ' ' {
                     continue;
                 }
@@ -212,7 +213,8 @@ impl TextRenderer {
                 }
             }
         }
-        let (col, row) = grid.cursor();
+        let cursor = term.cursor();
+        let (col, row) = (cursor.col, cursor.row);
         let cell = self.cell();
         self.instances.push(Instance {
             cell: pack(col, row),
@@ -272,9 +274,9 @@ pub fn grid_size(cell: CellMetrics, width: u32, height: u32) -> (u16, u16) {
 }
 
 /// Top-left of the grid: centred, splitting the leftover pixels.
-fn grid_origin(cell: CellMetrics, grid: &Grid, width: u32, height: u32) -> [u32; 2] {
-    let used_w = cell.width * u32::from(grid.cols());
-    let used_h = cell.height * u32::from(grid.rows());
+fn grid_origin(cell: CellMetrics, term: &Terminal, width: u32, height: u32) -> [u32; 2] {
+    let used_w = cell.width * u32::from(term.cols());
+    let used_h = cell.height * u32::from(term.rows());
     [
         width.saturating_sub(used_w) / 2,
         height.saturating_sub(used_h) / 2,
@@ -310,9 +312,9 @@ mod tests {
     fn grid_fits_and_centres() {
         assert_eq!(grid_size(CELL, 105, 41), (10, 2));
         assert_eq!(grid_size(CELL, 3, 3), (1, 1));
-        let grid = Grid::new(10, 2);
-        assert_eq!(grid_origin(CELL, &grid, 105, 41), [2, 0]);
-        assert_eq!(grid_origin(CELL, &grid, 100, 40), [0, 0]);
+        let term = Terminal::new(10, 2);
+        assert_eq!(grid_origin(CELL, &term, 105, 41), [2, 0]);
+        assert_eq!(grid_origin(CELL, &term, 100, 40), [0, 0]);
     }
 
     /// White text on black, red cursor, rendered offscreen and read back.
@@ -388,8 +390,8 @@ mod tests {
                 Format::R8G8B8A8_UNORM,
                 ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC,
             )?;
-            let mut grid = Grid::new(cols, rows);
-            grid.feed(text);
+            let mut term = Terminal::new(cols, rows);
+            term.feed(text);
             let colors = Colors {
                 foreground: [255, 255, 255, 255],
                 background: [0.0, 0.0, 0.0, 1.0],
@@ -410,7 +412,7 @@ mod tests {
                 Access::NONE,
                 Access::COLOR_ATTACHMENT,
             );
-            self.renderer.draw(&mut rec, &target, 0, &grid, &colors)?;
+            self.renderer.draw(&mut rec, &target, 0, &term, &colors)?;
             rec.transition(
                 &target,
                 ImageLayout::COLOR_ATTACHMENT_OPTIMAL,

@@ -7,11 +7,13 @@
 //! a termination signal).
 //!
 //! The shell runs in the session server (see [`crate::server`]), started on
-//! demand; the front end attaches, gets the PTY master, and draws what the
-//! shell prints into a raw grid ([`crate::grid`], no escape sequences yet).
+//! demand; the front end attaches, gets the PTY master, and feeds what the
+//! shell prints to the terminal core ([`crate::term`]).
 //!
-//! Frames are drawn only when the grid changed and no flip is in flight;
+//! Frames are drawn only when the screen changed and no flip is in flight;
 //! the flip-completion event frees the other buffer for the next frame.
+//! While a program has synchronized output on (DECSET 2026), frames wait
+//! until it's turned off, or [`SYNC_TIMEOUT`] passes.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -22,17 +24,21 @@ use rustix::io::Errno;
 use crate::cli::Args;
 use crate::event::Poller;
 use crate::font::{Font, fontconfig};
-use crate::grid::Grid;
 use crate::kms::{self, Card};
 use crate::scanout::{
     self, create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
 };
 use crate::session::Session;
 use crate::signals::{self, SignalFd};
+use crate::term::Terminal;
 use crate::text::{self, Colors, TextRenderer};
 use crate::{gbm, pty, server, vk};
 
 const BUFFER_COUNT: usize = 2;
+
+/// Longest a program's synchronized update can hold back drawing (what
+/// other terminals use), in case it never ends it.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
 // Event loop tokens.
 const SEAT: u64 = 0;
@@ -88,13 +94,13 @@ pub fn run(args: Args) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, BUFFER_COUNT)?;
-    let mut grid = Grid::new(cols, rows);
+    let mut term = Terminal::new(cols, rows);
     let colors = Colors::default();
 
     // First frame: render, wait on the CPU, and modeset with it.
     let start = Instant::now();
     render(&mut buffers[0], |rec, image| {
-        text.draw(rec, image, 0, &grid, &colors)
+        text.draw(rec, image, 0, &term, &colors)
     })?;
     buffers[0].cmd.wait()?;
 
@@ -122,6 +128,8 @@ pub fn run(args: Args) -> Result<()> {
     let mut next = 1;
     let mut flip_pending = false;
     let mut dirty = false;
+    // When the current synchronized update started.
+    let mut sync_since: Option<Instant> = None;
     let mut frames = 1u64;
 
     let mut poller = Poller::new().context("creating epoll instance")?;
@@ -135,16 +143,19 @@ pub fn run(args: Args) -> Result<()> {
 
     let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
     'events: loop {
-        let timeout = match deadline {
-            Some(d) => {
-                let left = d.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                Some(left)
-            }
-            None => None,
-        };
+        let now = Instant::now();
+        if deadline.is_some_and(|d| d <= now) {
+            break;
+        }
+        // Wake for the end of the run, and for a held-back frame.
+        let sync_end = sync_since
+            .map(|since| since + SYNC_TIMEOUT)
+            .filter(|&end| dirty && end > now);
+        let timeout = [deadline, sync_end]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|t| t.saturating_duration_since(now));
         poller.wait(timeout, &mut ready).context("epoll_wait")?;
 
         for &token in &ready {
@@ -176,8 +187,13 @@ pub fn run(args: Args) -> Result<()> {
                 PTY => match read_pty(&shell.master, &mut pty_buf)? {
                     Some(0) => {}
                     Some(n) => {
-                        grid.feed(&pty_buf[..n]);
+                        term.feed(&pty_buf[..n]);
                         dirty = true;
+                        if !term.synchronized() {
+                            sync_since = None;
+                        } else if sync_since.is_none() {
+                            sync_since = Some(Instant::now());
+                        }
                     }
                     None => {
                         tracing::info!("shell exited");
@@ -189,10 +205,11 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
 
-        if dirty && !flip_pending {
+        let held = sync_since.is_some_and(|since| since.elapsed() < SYNC_TIMEOUT);
+        if dirty && !flip_pending && !held {
             let slot = next;
             queue_frame(&mut display, &mut buffers[slot], |rec, image| {
-                text.draw(rec, image, slot, &grid, &colors)
+                text.draw(rec, image, slot, &term, &colors)
             })?;
             flip_pending = true;
             dirty = false;
@@ -266,13 +283,15 @@ fn probe(card: &Card, args: &Args) -> Result<()> {
     let mut buf = create_buffer(card, &gbm, &device, &output, &modifiers)?;
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, 1)?;
-    let mut grid = Grid::new(cols, rows);
-    grid.feed(
-        b"vellum --probe\r\nThe quick brown fox jumps over the lazy dog. 0123456789 {}[]()<>",
+    let mut term = Terminal::new(cols, rows);
+    term.feed(
+        b"\x1b[1mvellum --probe\x1b[m\r\n\
+          The quick brown fox jumps over the lazy dog. 0123456789 {}[]()<>\r\n\
+          \x1b(0lqqqk\r\nx   x\r\nmqqqj\x1b(B",
     );
     let start = Instant::now();
     render(&mut buf, |rec, image| {
-        text.draw(rec, image, 0, &grid, &Colors::default())
+        text.draw(rec, image, 0, &term, &Colors::default())
     })?;
     buf.cmd.wait()?;
     tracing::info!(

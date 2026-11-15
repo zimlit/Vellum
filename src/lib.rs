@@ -11,7 +11,6 @@ pub mod event;
 pub mod font;
 pub mod frontend;
 pub mod gbm;
-pub mod grid;
 pub mod kms;
 pub mod logging;
 pub mod pty;

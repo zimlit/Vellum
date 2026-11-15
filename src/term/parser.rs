@@ -550,7 +550,7 @@ impl Parser {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq)]

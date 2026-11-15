@@ -42,7 +42,7 @@ Language: **Rust** (all crate choices below assume it).
 | Shaping | **HarfRust** | HarfBuzz's official Rust port, built on `read-fonts`. Preferred over swash's shaper, which covers less. |
 | Outlines / hinting | **skrifa** (fontations) | FreeType-quality hinted outlines (TrueType bytecode, CFF, autohinter). It does NOT rasterize. |
 | Rasterization | **Own, as a GPU compute shader** | See "Glyph rasterizer" below. |
-| Terminal core | Undecided: write own parser vs `vte` crate / libvterm | Reference: Paul Williams' DEC/VT500 parser state machine (vt100.net). |
+| Terminal core | **Own parser and screen** (`src/term/`) | Paul Williams' DEC/VT500 state machine (vt100.net), UTF-8 only, colon subparameters kept. Behavior follows xterm where terminals differ. |
 
 **Dependency warning:** HarfRust, skrifa and read-fonts often make breaking changes in *minor* releases by bumping `read-fonts`. Pin all three to versions that share one `read-fonts`, and check `cargo tree -d` after every upgrade. Currently skrifa `=0.49.0`, which matches harfrust 0.15 (read-fonts 0.46).
 
