@@ -3,7 +3,7 @@
 //!
 //! The behavior follows xterm where terminals differ, since that's what
 //! `TERM=xterm-256color` promises. Not handled yet: wide characters and
-//! combining marks (roadmap step 8) and resize (the size is fixed).
+//! combining marks (roadmap step 9) and resize (the size is fixed).
 //! Sequences that aren't handled are logged once each at debug level,
 //! target `vellum::term`.
 //!

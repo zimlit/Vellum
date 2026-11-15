@@ -132,9 +132,10 @@ Notes:
 5. **Terminal core:** VT parser, grid, scrollback, alternate screen, SGR attributes.
 6. **Input:** libinput + xkbcommon, key → escape-sequence encoding.
 7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Until then vellum exits cleanly when its session is disabled.
-8. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
-9. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).
-10. Embedded Wayland compositor (see above).
+8. **Configuration and extensibility:** user settings (fonts, colors, keymap, key bindings, scrollback, ...) and a way to extend vellum. Technology and design are decided when this step is planned.
+9. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
+10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).
+11. Embedded Wayland compositor (see above).
 
 ## References
 
