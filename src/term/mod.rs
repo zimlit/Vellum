@@ -14,7 +14,7 @@
 pub mod cell;
 pub mod palette;
 pub mod parser;
-mod reply;
+pub(crate) mod reply;
 pub mod screen;
 pub mod scrollback;
 mod sgr;
@@ -986,6 +986,12 @@ impl Terminal {
             11 => &mut self.palette.background,
             _ => &mut self.palette.cursor,
         }
+    }
+
+    /// The unhandled sequences seen so far, as logged.
+    #[cfg(test)]
+    pub(crate) fn unhandled_sequences(&self) -> &HashSet<String> {
+        &self.reported
     }
 
     /// Log a sequence we don't handle, once.

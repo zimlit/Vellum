@@ -43,6 +43,7 @@ Language: **Rust** (all crate choices below assume it).
 | Outlines / hinting | **skrifa** (fontations) | FreeType-quality hinted outlines (TrueType bytecode, CFF, autohinter). It does NOT rasterize. |
 | Rasterization | **Own, as a GPU compute shader** | See "Glyph rasterizer" below. |
 | Terminal core | **Own parser and screen** (`src/term/`) | Paul Williams' DEC/VT500 state machine (vt100.net), UTF-8 only, colon subparameters kept. Behavior follows xterm where terminals differ. |
+| Terminfo | **Own entry `xterm-vellum`** (`terminfo/xterm-vellum.ti`) | Compiled by `tic` in `build.rs`, embedded, installed by the session server under `$XDG_DATA_HOME/vellum/terminfo` with `TERMINFO` pointing there (falls back to `xterm-256color`). Lists only what vellum implements; tests feed every capability through the terminal core and every key through the encoder. **Must compile to ≤ 4096 bytes**: narrow ncurses (`libtinfo.so`, used by Emacs and bash) treats larger entries as undefined; `build.rs` enforces it. Keep the XTGETTCAP table (`src/term/reply.rs`) in step. Remote hosts need `infocmp -x xterm-vellum \| ssh HOST tic -x -`. |
 
 **Dependency warning:** HarfRust, skrifa and read-fonts often make breaking changes in *minor* releases by bumping `read-fonts`. Pin all three to versions that share one `read-fonts`, and check `cargo tree -d` after every upgrade. Currently skrifa `=0.49.0`, which matches harfrust 0.15 (read-fonts 0.46).
 

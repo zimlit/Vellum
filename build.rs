@@ -4,6 +4,11 @@
 //! The stage comes from the extension (`.comp`, `.vert`, `.frag`); files
 //! with other extensions (e.g. `.glsl` includes) are not compiled on their
 //! own. Set `GLSLC` to use a specific compiler binary.
+//!
+//! Also compiles the terminfo entry `terminfo/xterm-vellum.ti` with ncurses'
+//! `tic` into `$OUT_DIR/terminfo/x/xterm-vellum`, embedded by
+//! `src/terminfo.rs`, and fails if the entry is over 4096 bytes (see
+//! `MAX_TERMINFO`). Set `TIC` to use a specific `tic`.
 
 use std::env;
 use std::fs;
@@ -13,6 +18,53 @@ use std::process::Command;
 const STAGES: &[&str] = &["comp", "vert", "frag"];
 
 fn main() {
+    shaders();
+    terminfo();
+}
+
+fn terminfo() {
+    let src = Path::new("terminfo/xterm-vellum.ti");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("terminfo");
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=TIC");
+    let tic = env::var_os("TIC").unwrap_or_else(|| "tic".into());
+    fs::create_dir_all(&out_dir).unwrap();
+    // -x: keep the user-defined capabilities (setf24, Smulx, ...).
+    let output = Command::new(&tic)
+        .arg("-x")
+        .arg("-o")
+        .arg(&out_dir)
+        .arg(src)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "running {}: {e}\nInstall ncurses (it provides tic) or set TIC.",
+                Path::new(&tic).display()
+            )
+        });
+    let compiled = out_dir.join("x/xterm-vellum");
+    if !output.status.success() || !compiled.exists() {
+        panic!(
+            "tic failed on {}:\n{}",
+            src.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The narrow ncurses library (libtinfo.so, linked by Emacs and bash)
+    // refuses entries over 4096 bytes, as if they didn't exist.
+    let size = fs::metadata(&compiled).unwrap().len();
+    if size > MAX_TERMINFO {
+        panic!(
+            "{} compiles to {size} bytes; narrow ncurses reads at most {MAX_TERMINFO}",
+            src.display()
+        );
+    }
+}
+
+/// Largest compiled terminfo entry every ncurses build can read.
+const MAX_TERMINFO: u64 = 4096;
+
+fn shaders() {
     let src_dir = Path::new("shaders");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("shaders");
     // A directory makes cargo rerun when anything under it changes.

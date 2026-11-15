@@ -649,10 +649,10 @@ fn osc_color_queries() {
 #[test]
 fn terminfo_capability_queries() {
     let mut t = Terminal::new(10, 1);
-    // "TN" and "Co"; then an unknown name and a boolean.
+    // "TN" (xterm-vellum) and "Co"; then an unknown name and a boolean.
     assert_eq!(
         replies(&mut t, "\x1bP+q544E;436F\x1b\\"),
-        "\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\\x1bP1+r436F=323536\x1b\\"
+        "\x1bP1+r544E=787465726D2D76656C6C756D\x1b\\\x1bP1+r436F=323536\x1b\\"
     );
     assert_eq!(
         replies(&mut t, "\x1bP+q78797A;524742\x1b\\"),

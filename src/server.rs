@@ -393,7 +393,11 @@ pub fn main(path: PathBuf) -> Result<()> {
     Server::new(
         listener,
         Some(path),
-        Box::new(pty::shell_command),
+        {
+            let info = pty::TermInfo::install();
+            tracing::info!(term = info.term(), "shell terminfo");
+            Box::new(move || pty::shell_command(&info))
+        },
         Some(signals),
     )?
     .run()?;
@@ -750,7 +754,7 @@ mod tests {
         std::thread::spawn(move || {
             let command = Box::new(|| {
                 let mut cmd = Command::new("/bin/sh");
-                pty::terminal_env(&mut cmd).env("PS1", "$ ");
+                pty::terminal_env(&mut cmd, &pty::TermInfo::Fallback).env("PS1", "$ ");
                 cmd
             });
             let result =

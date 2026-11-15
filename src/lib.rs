@@ -22,6 +22,7 @@ pub mod server;
 pub mod session;
 pub mod signals;
 pub mod term;
+pub mod terminfo;
 #[cfg(test)]
 mod testutil;
 pub mod text;

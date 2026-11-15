@@ -68,9 +68,11 @@ fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
 /// terminfo capabilities answered through XTGETTCAP: name and value, with
 /// `None` for booleans. String values are the expanded bytes (real ESC),
 /// as xterm sends them.
-const CAPABILITIES: &[(&str, Option<&str>)] = &[
-    ("TN", Some(crate::pty::TERM)),
-    ("name", Some(crate::pty::TERM)),
+pub(crate) const CAPABILITIES: &[(&str, Option<&str>)] = &[
+    // The session server falls back to xterm-256color if it can't install
+    // the entry; this still names the one that describes vellum.
+    ("TN", Some(crate::terminfo::NAME)),
+    ("name", Some(crate::terminfo::NAME)),
     ("Co", Some("256")),
     ("colors", Some("256")),
     // Direct color: both spellings programs look for.

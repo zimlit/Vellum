@@ -14,19 +14,60 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{self, tcsetwinsize};
 
-use crate::signals;
+use crate::{signals, terminfo};
 
-/// `$TERM` for programs in the terminal: the emulation the terminal core
-/// (`crate::term`) follows.
-pub const TERM: &str = "xterm-256color";
-
-/// `$COLORTERM`: SGR 38/48 with RGB colors work (terminfo can't say so).
+/// `$COLORTERM`: SGR 38/48 with RGB colors work. Programs that don't read
+/// terminfo's 24-bit capabilities look for this.
 pub const COLORTERM: &str = "truecolor";
+
+/// Which terminfo entry programs in the terminal get.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TermInfo {
+    /// vellum's own entry ([`terminfo::NAME`]), installed in this
+    /// directory, which becomes `$TERMINFO`.
+    Vellum(PathBuf),
+    /// [`terminfo::FALLBACK`], from the system.
+    Fallback,
+}
+
+impl TermInfo {
+    /// Install vellum's entry in [`terminfo::default_dir`], or fall back
+    /// (with a warning) if that fails.
+    pub fn install() -> Self {
+        let Some(dir) = terminfo::default_dir() else {
+            tracing::warn!(
+                "no XDG_DATA_HOME or HOME for the terminfo entry; using TERM={}",
+                terminfo::FALLBACK
+            );
+            return Self::Fallback;
+        };
+        match terminfo::install(&dir) {
+            Ok(()) => Self::Vellum(dir),
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "installing the terminfo entry: {e}; using TERM={}",
+                    terminfo::FALLBACK
+                );
+                Self::Fallback
+            }
+        }
+    }
+
+    /// The value of `$TERM`.
+    pub fn term(&self) -> &'static str {
+        match self {
+            Self::Vellum(_) => terminfo::NAME,
+            Self::Fallback => terminfo::FALLBACK,
+        }
+    }
+}
 
 /// Variables other terminals set to identify themselves. They're inherited
 /// when vellum is started from inside one (e.g. over SSH with `SendEnv`),
@@ -49,14 +90,20 @@ const OTHER_TERMINALS: &[&str] = &[
     "TERM_SESSION_ID",
 ];
 
-/// Set the environment that describes vellum to programs in it: `TERM`,
-/// `COLORTERM`, `TERM_PROGRAM` and `TERM_PROGRAM_VERSION`, and remove what
-/// another terminal may have left there.
-pub fn terminal_env(cmd: &mut Command) -> &mut Command {
+/// Set the environment that describes vellum to programs in it: `TERM`
+/// (and `TERMINFO` for vellum's own entry), `COLORTERM`, `TERM_PROGRAM` and
+/// `TERM_PROGRAM_VERSION`, and remove what another terminal may have left
+/// there.
+pub fn terminal_env<'a>(cmd: &'a mut Command, info: &TermInfo) -> &'a mut Command {
     for var in OTHER_TERMINALS {
         cmd.env_remove(var);
     }
-    cmd.env("TERM", TERM)
+    match info {
+        TermInfo::Vellum(dir) => cmd.env("TERMINFO", dir),
+        // A TERMINFO from outside may still lead somewhere useful.
+        TermInfo::Fallback => cmd,
+    };
+    cmd.env("TERM", info.term())
         .env("COLORTERM", COLORTERM)
         .env("TERM_PROGRAM", "vellum")
         .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
@@ -190,12 +237,12 @@ impl Writer {
 }
 
 /// The user's shell (`$SHELL`, else `/bin/sh`) with the [`terminal_env`].
-pub fn shell_command() -> Command {
+pub fn shell_command(info: &TermInfo) -> Command {
     let shell = std::env::var_os("SHELL")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut cmd = Command::new(shell);
-    terminal_env(&mut cmd);
+    terminal_env(&mut cmd, info);
     cmd
 }
 
@@ -253,7 +300,7 @@ pub mod tests {
 
     fn run(script: &str) -> String {
         let mut cmd = Command::new("/bin/sh");
-        terminal_env(cmd.arg("-c").arg(script));
+        terminal_env(cmd.arg("-c").arg(script), &TermInfo::Fallback);
         let mut spawned = spawn(cmd, SIZE).unwrap();
         let (out, hung_up) = read_until(&spawned.master, Duration::from_secs(10), |_| false);
         assert!(
@@ -310,14 +357,38 @@ pub mod tests {
 
     #[test]
     fn shell_command_describes_vellum() {
-        let cmd = shell_command();
+        let cmd = shell_command(&TermInfo::Vellum("/data/vellum/terminfo".into()));
         let envs: Vec<_> = cmd.get_envs().collect();
         let has = |k: &str, v: &str| envs.contains(&(k.as_ref(), Some(v.as_ref())));
-        assert!(has("TERM", TERM));
+        assert!(has("TERM", "xterm-vellum"));
+        assert!(has("TERMINFO", "/data/vellum/terminfo"));
         assert!(has("COLORTERM", COLORTERM));
         assert!(has("TERM_PROGRAM", "vellum"));
         // Another terminal's markers are removed (None: unset).
         assert!(envs.contains(&("VTE_VERSION".as_ref(), None)));
+
+        let cmd = shell_command(&TermInfo::Fallback);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&("TERM".as_ref(), Some("xterm-256color".as_ref()))));
+        assert!(!envs.iter().any(|(k, _)| *k == "TERMINFO"));
+    }
+
+    #[test]
+    fn child_finds_the_entry() {
+        let dir = crate::testutil::TempDir::new();
+        terminfo::install(dir.path()).unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        let info = TermInfo::Vellum(dir.path().to_owned());
+        terminal_env(
+            cmd.arg("-c")
+                .arg("echo $TERM; tput colors; tput -T xterm colors"),
+            &info,
+        );
+        let mut spawned = spawn(cmd, SIZE).unwrap();
+        let (out, _) = read_until(&spawned.master, Duration::from_secs(10), |_| false);
+        spawned.child.wait().unwrap();
+        // The system entries are still found with TERMINFO set.
+        assert_eq!(out, b"xterm-vellum\r\n256\r\n8\r\n");
     }
 
     #[test]
