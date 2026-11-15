@@ -1,0 +1,97 @@
+// Pass 1 of the glyph rasterizer: one invocation per line segment adds the
+// signed area the segment contributes to each pixel of its row into the
+// accumulation grid. A GPU port of font-rs's `draw_line` (Raph Levien).
+//
+// For each scanline the segment crosses, `d` is the signed height of the
+// part of the segment in that row (sign = direction, so contours of
+// opposite winding cancel). The area to the right of the segment within the
+// pixel(s) it crosses is split between those pixels; the remainder of `d`
+// carries to the right through the running sum in the resolve pass.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "raster.glsl"
+
+layout(local_size_x = 64) in;
+
+uint g_base;
+int g_stride;
+int g_row;
+
+void add(int x, float v) {
+    // Out-of-row writes would land in a neighbour; drop them instead.
+    if (x < 0 || x >= g_stride) {
+        return;
+    }
+    atomicAdd(accum.cells[g_base + uint(g_row * g_stride + x)], int(round(v * SCALE)));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= segment_count) {
+        return;
+    }
+    Segment s = seg.segments[i];
+    Job j = job.jobs[s.job];
+    g_base = j.accum_offset;
+    g_stride = int(j.size.x) + 2;
+    int h = int(j.size.y);
+
+    vec2 p0 = s.p0;
+    vec2 p1 = s.p1;
+    if (abs(p0.y - p1.y) <= 1e-7) {
+        return; // horizontal: no area
+    }
+    float dir = 1.0;
+    if (p0.y > p1.y) {
+        dir = -1.0;
+        vec2 t = p0;
+        p0 = p1;
+        p1 = t;
+    }
+    float dxdy = (p1.x - p0.x) / (p1.y - p0.y);
+    float x = p0.x;
+    if (p0.y < 0.0) {
+        x -= p0.y * dxdy;
+    }
+    int y0 = int(floor(max(p0.y, 0.0)));
+    int y1 = min(h, int(ceil(p1.y)));
+    for (int y = y0; y < y1; y++) {
+        g_row = y;
+        float dy = min(float(y + 1), p1.y) - max(float(y), p0.y);
+        float xnext = x + dxdy * dy;
+        float d = dy * dir;
+        float x0 = min(x, xnext);
+        float x1 = max(x, xnext);
+        float x0floor = floor(x0);
+        int x0i = int(x0floor);
+        float x1ceil = ceil(x1);
+        int x1i = int(x1ceil);
+        if (x1i <= x0i + 1) {
+            // Within one pixel column: split at the segment's mean x.
+            float xmf = 0.5 * (x + xnext) - x0floor;
+            add(x0i, d - d * xmf);
+            add(x0i + 1, d * xmf);
+        } else {
+            // Spans several columns: trapezoids, constant in between.
+            float s = 1.0 / (x1 - x0);
+            float x0f = x0 - x0floor;
+            float a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+            float x1f = x1 - x1ceil + 1.0;
+            float am = 0.5 * s * x1f * x1f;
+            add(x0i, d * a0);
+            if (x1i == x0i + 2) {
+                add(x0i + 1, d * (1.0 - a0 - am));
+            } else {
+                float a1 = s * (1.5 - x0f);
+                add(x0i + 1, d * (a1 - a0));
+                for (int xi = x0i + 2; xi < x1i - 1; xi++) {
+                    add(xi, d * s);
+                }
+                float a2 = a1 + float(x1i - x0i - 3) * s;
+                add(x1i - 1, d * (1.0 - a2 - am));
+            }
+            add(x1i, d * am);
+        }
+        x = xnext;
+    }
+}

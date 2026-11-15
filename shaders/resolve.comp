@@ -1,0 +1,35 @@
+// Pass 2 of the glyph rasterizer: one workgroup per glyph, invocations
+// striding over its rows. A running sum along each row turns the deposited
+// area differences into coverage (nonzero winding: |sum|, capped at 1),
+// written to the atlas. Coverage stays linear; gamma etc. happen when
+// drawing text.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "raster.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D atlas;
+
+// Fixed-point rounding leaves faint haze where coverage should be zero.
+const float MIN_COVERAGE = 1.0 / 512.0;
+
+void main() {
+    Job j = job.jobs[job_base + gl_WorkGroupID.x];
+    int w = int(j.size.x);
+    int h = int(j.size.y);
+    int stride = w + 2;
+    ivec2 origin = ivec2(j.atlas_origin);
+    for (int y = int(gl_LocalInvocationID.x); y < h; y += int(gl_WorkGroupSize.x)) {
+        uint row = j.accum_offset + uint(y * stride);
+        int sum = 0; // integer: exact, no drift along the row
+        for (int x = 0; x < w; x++) {
+            sum += accum.cells[row + uint(x)];
+            float c = min(abs(float(sum)) / SCALE, 1.0);
+            if (c < MIN_COVERAGE) {
+                c = 0.0;
+            }
+            imageStore(atlas, origin + ivec2(x, y), vec4(c));
+        }
+    }
+}

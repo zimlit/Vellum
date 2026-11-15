@@ -14,6 +14,7 @@ pub mod gbm;
 pub mod kms;
 pub mod logging;
 pub mod pty;
+pub mod raster;
 pub mod scanout;
 pub mod server;
 pub mod session;
