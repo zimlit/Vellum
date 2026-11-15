@@ -345,6 +345,12 @@ impl Drop for Image {
 pub trait RenderTarget: Send + Sync + 'static {
     #[doc(hidden)]
     fn view_and_extent(&self) -> (vk::ImageView, vk::Extent2D);
+
+    /// Width and height in pixels.
+    fn size(&self) -> (u32, u32) {
+        let (_, extent) = self.view_and_extent();
+        (extent.width, extent.height)
+    }
 }
 
 impl RenderTarget for Image {

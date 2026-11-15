@@ -122,6 +122,26 @@ pub struct Output {
     pub plane: plane::Handle,
     pub plane_props: Props,
     pub mode: Mode,
+    /// Physical size of the display in millimetres, if the monitor reports
+    /// one (projectors and some TVs don't).
+    pub size_mm: Option<(u32, u32)>,
+}
+
+impl Output {
+    /// Dots per inch, from the mode's width and the physical width; 96 when
+    /// the size is unknown or implausible.
+    pub fn dpi(&self) -> f64 {
+        dpi(self.mode.size().0, self.size_mm)
+    }
+}
+
+fn dpi(width_px: u16, size_mm: Option<(u32, u32)>) -> f64 {
+    const FALLBACK: f64 = 96.0;
+    match size_mm {
+        // Some EDIDs give the aspect ratio (e.g. 16x9 "mm") instead.
+        Some((w, _)) if w >= 50 => f64::from(width_px) * 25.4 / f64::from(w),
+        _ => FALLBACK,
+    }
 }
 
 /// Find the first connected connector we can drive, and a CRTC and primary
@@ -172,6 +192,7 @@ pub fn select_output(card: &Card) -> Result<Output> {
                     plane,
                     plane_props,
                     mode,
+                    size_mm: conn.size().filter(|&(w, h)| w > 0 && h > 0),
                 });
             }
         }
@@ -690,6 +711,15 @@ mod tests {
     use super::*;
     use crate::gbm;
     use crate::testutil::{self, TempDir};
+
+    #[test]
+    fn dpi_from_physical_width() {
+        // 27" 4K: 597 mm wide.
+        assert!((dpi(3840, Some((597, 336))) - 163.4).abs() < 0.1);
+        assert_eq!(dpi(1920, None), 96.0);
+        // Aspect ratio given instead of a size.
+        assert_eq!(dpi(1920, Some((16, 9))), 96.0);
+    }
 
     // --- connected_cards -------------------------------------------------
 

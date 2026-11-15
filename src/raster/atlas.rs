@@ -2,7 +2,9 @@
 //!
 //! The atlas is cut into horizontal shelves. A glyph goes on the shelf
 //! whose height fits it most tightly and that has room left; otherwise a new
-//! shelf exactly its height opens below the last. Monospace glyphs at one
+//! shelf exactly its height opens below the last. When there's no room for
+//! a new shelf, the bottom one may grow taller instead, if the atlas has the
+//! height (a short first glyph shouldn't make a shelf useless). Monospace glyphs at one
 //! size have similar heights, so shelves fill well. Nothing is freed
 //! individually: when the atlas is full, everything is cleared and the
 //! glyphs on screen are rasterized again.
@@ -56,10 +58,7 @@ impl Packer {
             .min_by_key(|s| s.height - height);
         let shelf = match best {
             Some(shelf) => shelf,
-            None => {
-                if self.next_y + height > self.height {
-                    return None;
-                }
+            None if self.next_y + height <= self.height => {
                 self.shelves.push(Shelf {
                     y: self.next_y,
                     height,
@@ -67,6 +66,16 @@ impl Packer {
                 });
                 self.next_y += height;
                 self.shelves.last_mut().unwrap()
+            }
+            None => {
+                // Grow the bottom shelf (nothing is below it).
+                let last = self.shelves.last_mut()?;
+                if last.x + width > self.width || last.y + height > self.height {
+                    return None;
+                }
+                last.height = height;
+                self.next_y = last.y + height;
+                last
             }
         };
         let rect = Rect {
@@ -146,6 +155,29 @@ mod tests {
         assert_eq!(p.alloc(3, 4).unwrap().y, 8);
         // Too tall for shelf 1: back to shelf 0.
         assert_eq!(p.alloc(3, 6).unwrap().y, 0);
+    }
+
+    #[test]
+    fn bottom_shelf_grows_when_no_new_shelf_fits() {
+        let mut p = Packer::new(10, 6);
+        assert_eq!(p.alloc(3, 4).unwrap().y, 0); // shelf 0, height 4
+        // A height-6 shelf won't fit below, but shelf 0 can grow to 6.
+        assert_eq!(
+            p.alloc(3, 6),
+            Some(Rect {
+                x: 3,
+                y: 0,
+                width: 3,
+                height: 6
+            })
+        );
+        assert_eq!(p.alloc(3, 7), None, "taller than the atlas");
+        // Only the bottom shelf grows.
+        let mut q = Packer::new(10, 9);
+        q.alloc(10, 4).unwrap(); // shelf 0, full width
+        q.alloc(2, 4).unwrap(); // shelf 1 at y 4
+        assert_eq!(q.alloc(2, 5).unwrap().y, 4, "shelf 1 grows to 5");
+        assert_eq!(q.alloc(2, 6), None);
     }
 
     #[test]

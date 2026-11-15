@@ -8,7 +8,6 @@
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use drm::buffer::DrmFourcc;
@@ -139,41 +138,30 @@ pub fn create_buffer<'a>(
     })
 }
 
-/// Record and submit this buffer's frame. Returns a sync_file that signals
-/// when rendering is done, or `None` if it already is.
-pub fn render(buf: &mut Buffer, start: Instant) -> Result<Option<OwnedFd>> {
-    let color = animated_color(start.elapsed());
+/// Record and submit this buffer's frame: `draw` renders into the image,
+/// which is in `COLOR_ATTACHMENT_OPTIMAL` and owned by Vulkan for the call.
+/// Returns a sync_file that signals when rendering is done, or `None` if it
+/// already is.
+pub fn render(
+    buf: &mut Buffer,
+    draw: impl FnOnce(&mut vk::Recorder, &Arc<vk::DmaBufImage>) -> Result<()>,
+) -> Result<Option<OwnedFd>> {
     let mut rec = buf.cmd.begin()?;
     rec.acquire_from_foreign(&buf.image);
-    rec.clear(&buf.image, color)?;
+    draw(&mut rec, &buf.image)?;
     rec.release_to_foreign(&buf.image);
     rec.submit(Some(&buf.rendered))?;
     buf.rendered.export_sync_file()
 }
 
 /// Render into `buf` and queue a flip to it, fenced on the rendering.
-pub fn queue_frame(display: &mut kms::Display, buf: &mut Buffer, start: Instant) -> Result<()> {
-    let fence = render(buf, start)?;
+pub fn queue_frame(
+    display: &mut kms::Display,
+    buf: &mut Buffer,
+    draw: impl FnOnce(&mut vk::Recorder, &Arc<vk::DmaBufImage>) -> Result<()>,
+) -> Result<()> {
+    let fence = render(buf, draw)?;
     display.flip(&buf.fb, fence.as_ref())
-}
-
-/// Slowly cycling hue, so dropped or torn frames are visible.
-pub fn animated_color(t: Duration) -> [f32; 4] {
-    const PERIOD: f32 = 6.0;
-    let h = (t.as_secs_f32() / PERIOD).fract() * 6.0;
-    let (s, v) = (0.6, 0.5);
-    let c = v * s;
-    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
-    let (r, g, b) = match h as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = v - c;
-    [r + m, g + m, b + m, 1.0]
 }
 
 #[cfg(test)]
@@ -192,30 +180,6 @@ mod tests {
         assert!(intersect_modifiers(&[], &[1]).is_empty());
     }
 
-    #[test]
-    fn animated_color_is_valid_opaque_rgb() {
-        for ms in (0..12_000).step_by(37) {
-            let c = animated_color(Duration::from_millis(ms));
-            assert!(
-                c[..3].iter().all(|v| (0.0..=1.0).contains(v)),
-                "{c:?} at {ms}ms"
-            );
-            assert_eq!(c[3], 1.0);
-        }
-    }
-
-    #[test]
-    fn animated_color_starts_red_and_repeats() {
-        let at = |s: f32| animated_color(Duration::from_secs_f32(s));
-        // Hue 0: red is the dominant channel, green and blue equal.
-        let c = at(0.0);
-        assert!(c[0] > c[1] && c[1] == c[2]);
-        // 6 s period.
-        for (a, b) in at(1.3).iter().zip(at(7.3)) {
-            assert!((a - b).abs() < 1e-4);
-        }
-    }
-
     /// The real setup path minus the modeset: output selection, modifier
     /// negotiation, GBM allocation, KMS + Vulkan import, and rendering with
     /// an exported fence that actually signals.
@@ -232,9 +196,11 @@ mod tests {
         let mut buf = create_buffer(&card, &gbm, &device, &output, &modifiers).unwrap();
         assert!(modifiers.contains(&buf.bo.modifier()));
 
-        let start = Instant::now();
-        for _ in 0..3 {
-            if let Some(fence) = render(&mut buf, start).unwrap() {
+        for i in 0..3 {
+            let clear = |rec: &mut vk::Recorder, image: &Arc<vk::DmaBufImage>| {
+                rec.clear(image, [0.1 * i as f32, 0.0, 0.0, 1.0])
+            };
+            if let Some(fence) = render(&mut buf, clear).unwrap() {
                 let mut fds = [PollFd::new(&fence, PollFlags::IN)];
                 let timeout = Timespec {
                     tv_sec: 5,

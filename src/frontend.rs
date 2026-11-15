@@ -7,8 +7,11 @@
 //! a termination signal).
 //!
 //! The shell runs in the session server (see [`crate::server`]), started on
-//! demand; the front end attaches and gets the PTY master. Until text
-//! rendering exists (step 4) the shell's output only goes to the log.
+//! demand; the front end attaches, gets the PTY master, and draws what the
+//! shell prints into a raw grid ([`crate::grid`], no escape sequences yet).
+//!
+//! Frames are drawn only when the grid changed and no flip is in flight;
+//! the flip-completion event frees the other buffer for the next frame.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -18,17 +21,18 @@ use rustix::io::Errno;
 
 use crate::cli::Args;
 use crate::event::Poller;
+use crate::font::{Font, fontconfig};
+use crate::grid::Grid;
 use crate::kms::{self, Card};
 use crate::scanout::{
-    create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
+    self, create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
 };
 use crate::session::Session;
 use crate::signals::{self, SignalFd};
+use crate::text::{self, Colors, TextRenderer};
 use crate::{gbm, pty, server, vk};
 
 const BUFFER_COUNT: usize = 2;
-/// Cell size used for the PTY's size until there is a font (step 4).
-const PLACEHOLDER_CELL: (u16, u16) = (8, 16);
 
 // Event loop tokens.
 const SEAT: u64 = 0;
@@ -45,19 +49,22 @@ pub fn run(args: Args) -> Result<()> {
 
     if args.probe {
         let card = Card::open_direct(&path)?;
-        return probe(&card);
+        return probe(&card, &args);
     }
 
     let mut session = Session::open()?;
     let card = Card::new(session.open_device(&path)?);
     let output = prepare(&card)?;
+    let font = load_font(&args.font, output.dpi())?;
 
     let (w, h) = output.mode.size();
+    let cell = font.cell();
+    let (cols, rows) = text::grid_size(cell, w.into(), h.into());
     let size = pty::WinSize {
-        cols: w / PLACEHOLDER_CELL.0,
-        rows: h / PLACEHOLDER_CELL.1,
-        width: w,
-        height: h,
+        cols,
+        rows,
+        width: (u32::from(cols) * cell.width).min(u16::MAX.into()) as u16,
+        height: (u32::from(rows) * cell.height).min(u16::MAX.into()) as u16,
     };
     let socket = server::socket_path()?;
     let shell = server::attach(&socket, size)?;
@@ -79,10 +86,16 @@ pub fn run(args: Args) -> Result<()> {
     let mut buffers = (0..BUFFER_COUNT)
         .map(|_| create_buffer(&card, &gbm, &device, &output, &modifiers))
         .collect::<Result<Vec<_>>>()?;
+    let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
+    let mut text = TextRenderer::new(&device, font, format, BUFFER_COUNT)?;
+    let mut grid = Grid::new(cols, rows);
+    let colors = Colors::default();
 
     // First frame: render, wait on the CPU, and modeset with it.
     let start = Instant::now();
-    render(&mut buffers[0], start)?;
+    render(&mut buffers[0], |rec, image| {
+        text.draw(rec, image, 0, &grid, &colors)
+    })?;
     buffers[0].cmd.wait()?;
 
     // Locals drop in reverse order: the display state is restored first (after
@@ -103,11 +116,13 @@ pub fn run(args: Args) -> Result<()> {
         }
     );
 
-    // Buffer `shown` is on screen; `queued` is flipping to it next.
+    // Buffer `shown` is on screen; `next` is free to render into, or being
+    // flipped to while `flip_pending`.
     let mut shown = 0;
-    let mut queued = 1;
-    queue_frame(&mut display, &mut buffers[queued], start)?;
-    let mut flips = 0u64;
+    let mut next = 1;
+    let mut flip_pending = false;
+    let mut dirty = false;
+    let mut frames = 1u64;
 
     let mut poller = Poller::new().context("creating epoll instance")?;
     poller.add(session.fd(), SEAT)?;
@@ -150,32 +165,44 @@ pub fn run(args: Args) -> Result<()> {
                 }
                 CARD => {
                     if display.dispatch_events()? {
-                        // `queued` is on screen now, so the previously shown
+                        // `next` is on screen now, so the previously shown
                         // buffer is no longer scanned out and can be
                         // rendered into.
-                        flips += 1;
-                        (shown, queued) = (queued, shown);
-                        tracing::trace!(flips, shown, "page flip completed");
-                        queue_frame(&mut display, &mut buffers[queued], start)?;
+                        (shown, next) = (next, shown);
+                        flip_pending = false;
+                        tracing::trace!(shown, "page flip completed");
                     }
                 }
-                PTY => {
-                    if !read_pty(&shell.master, &mut pty_buf)? {
+                PTY => match read_pty(&shell.master, &mut pty_buf)? {
+                    Some(0) => {}
+                    Some(n) => {
+                        grid.feed(&pty_buf[..n]);
+                        dirty = true;
+                    }
+                    None => {
                         tracing::info!("shell exited");
                         shell_alive = false;
                         break 'events;
                     }
-                }
+                },
                 _ => unreachable!("unknown event token {token}"),
             }
         }
+
+        if dirty && !flip_pending {
+            let slot = next;
+            queue_frame(&mut display, &mut buffers[slot], |rec, image| {
+                text.draw(rec, image, slot, &grid, &colors)
+            })?;
+            flip_pending = true;
+            dirty = false;
+            frames += 1;
+        }
     }
 
-    let secs = start.elapsed().as_secs_f64();
     tracing::info!(
-        flips,
-        seconds = %format_args!("{secs:.1}"),
-        rate_hz = %format_args!("{:.1}", flips as f64 / secs),
+        frames,
+        seconds = %format_args!("{:.1}", start.elapsed().as_secs_f64()),
         "shutting down"
     );
     // Only an orderly exit ends the shell; after a crash (error return,
@@ -186,21 +213,39 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Read what the shell wrote. Until text rendering (step 4) it only goes to
-/// the log. Returns false once the shell is gone.
-fn read_pty(master: &OwnedFd, buf: &mut [u8]) -> Result<bool> {
+/// Read what the shell wrote into `buf`: `Some(bytes read)` (0 if nothing
+/// was ready), or `None` once the shell is gone.
+fn read_pty(master: &OwnedFd, buf: &mut [u8]) -> Result<Option<usize>> {
     match rustix::io::read(master, &mut *buf) {
         // EIO: every slave fd is closed, i.e. the shell (and anything else
         // using the terminal) has exited.
-        Ok(0) | Err(Errno::IO) => Ok(false),
+        Ok(0) | Err(Errno::IO) => Ok(None),
         Ok(n) => {
-            tracing::debug!(bytes = n, "shell output");
             tracing::trace!(target: "vellum::pty", "{}", buf[..n].escape_ascii());
-            Ok(true)
+            Ok(Some(n))
         }
-        Err(Errno::AGAIN | Errno::INTR) => Ok(true),
+        Err(Errno::AGAIN | Errno::INTR) => Ok(Some(0)),
         Err(e) => Err(e).context("reading the PTY"),
     }
+}
+
+/// Find and load the font for `pattern` at the monitor's DPI.
+fn load_font(pattern: &str, dpi: f64) -> Result<Font> {
+    let m = fontconfig::Config::new()?.match_font(pattern, dpi)?;
+    let font = Font::load(&m)?;
+    let cell = font.cell();
+    tracing::info!(
+        pattern,
+        family = %m.family,
+        style = %m.style,
+        file = %m.path.display(),
+        pixel_size = %format_args!("{:.1}", m.pixel_size),
+        dpi = %format_args!("{dpi:.0}"),
+        cell = %format_args!("{}x{}", cell.width, cell.height),
+        rendering = ?m.rendering,
+        "loaded font"
+    );
+    Ok(font)
 }
 
 /// Everything short of the modeset, without a seat. Useful from SSH or from
@@ -209,20 +254,32 @@ fn read_pty(master: &OwnedFd, buf: &mut [u8]) -> Result<bool> {
 ///
 /// The interesting details (output, GPU, modifiers, buffer layout) are logged
 /// by the shared setup functions; run with `VELLUM_LOG=debug` to see them all.
-fn probe(card: &Card) -> Result<()> {
+fn probe(card: &Card, args: &Args) -> Result<()> {
     let output = prepare(card)?;
+    let font = load_font(&args.font, output.dpi())?;
+    let (w, h) = output.mode.size();
+    let (cols, rows) = text::grid_size(font.cell(), w.into(), h.into());
     let instance = vk::Instance::new(cfg!(debug_assertions))?;
     let device = vulkan_device(&instance, card)?;
     let gbm = gbm::Device::new(card.as_fd()).context("gbm_create_device")?;
     let modifiers = negotiate_modifiers(card, &output, &device)?;
     let mut buf = create_buffer(card, &gbm, &device, &output, &modifiers)?;
+    let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
+    let mut text = TextRenderer::new(&device, font, format, 1)?;
+    let mut grid = Grid::new(cols, rows);
+    grid.feed(
+        b"vellum --probe\r\nThe quick brown fox jumps over the lazy dog. 0123456789 {}[]()<>",
+    );
     let start = Instant::now();
-    render(&mut buf, start)?;
+    render(&mut buf, |rec, image| {
+        text.draw(rec, image, 0, &grid, &Colors::default())
+    })?;
     buf.cmd.wait()?;
     tracing::info!(
         render_time = ?start.elapsed(),
         framebuffer = ?buf.fb.handle,
-        "probe ok: rendered one frame (modeset skipped: needs DRM master via the seat)"
+        grid = %format_args!("{cols}x{rows}"),
+        "probe ok: rendered one frame of text (modeset skipped: needs DRM master via the seat)"
     );
     Ok(())
 }

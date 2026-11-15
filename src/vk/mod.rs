@@ -25,7 +25,7 @@ pub use ash::vk::{BufferUsageFlags, Format, ImageLayout, ImageUsageFlags};
 pub use buffer::{Buffer, Pod, bytes_of};
 pub use command::{Access, CommandBuffer, Recorder};
 pub use device::Device;
-pub use image::{DmaBufImage, Image, Modifier, RenderTarget};
+pub use image::{DmaBufImage, Image, Modifier, RenderTarget, vk_format};
 pub use instance::Instance;
 pub use memory::Location;
 pub use pipeline::{Blend, ComputePipeline, DescriptorSet, GraphicsPipeline, Layout};

@@ -156,14 +156,13 @@ impl Rasterizer {
         Ok(Some(rect))
     }
 
-    /// Forget all atlas contents. Rects from earlier `queue` calls are no
-    /// longer valid. Must not be called with a batch pending.
-    pub fn clear(&mut self) -> Result<()> {
-        if !self.jobs.is_empty() {
-            bail!("clearing the atlas with glyphs still queued");
-        }
+    /// Forget all atlas contents and drop any pending batch. Rects from
+    /// earlier `queue` calls are no longer valid.
+    pub fn clear(&mut self) {
         self.packer.clear();
-        Ok(())
+        self.segments.clear();
+        self.jobs.clear();
+        self.accum_cells = 0;
     }
 
     /// Whether glyphs are waiting for [`Self::record`].
@@ -549,13 +548,11 @@ mod tests {
         let big = polygon(200, 200, &[[1.0, 1.0], [199.0, 1.0], [199.0, 199.0]]);
         g.raster.queue(&big).unwrap().unwrap();
         assert_eq!(g.raster.queue(&big), Err(AtlasFull));
-        assert!(g.raster.clear().is_err(), "batch still pending");
-        let mut cmd = CommandBuffer::new(&g.device).unwrap();
-        let mut rec = cmd.begin().unwrap();
-        g.raster.record(&mut rec).unwrap();
-        rec.submit(None).unwrap();
-        cmd.wait().unwrap();
-        g.raster.clear().unwrap();
-        assert!(g.raster.queue(&big).unwrap().is_some());
+        // Clearing drops the pending batch too.
+        g.raster.clear();
+        assert!(!g.raster.pending());
+        // And the space is free again.
+        let rendered = g.rasterize(std::slice::from_ref(&big));
+        assert_matches_reference(&rendered[0], &big);
     }
 }
