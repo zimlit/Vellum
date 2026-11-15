@@ -3,8 +3,13 @@
 //! libseat gives us DRM master and input device fds without root, and the
 //! seat backend puts the VT into graphics mode with the keyboard off while we
 //! hold the session (and puts it back when we release it).
+//!
+//! When the user switches to another VT the seat *disables* the session:
+//! DRM master and the input devices are taken away, and the seat waits for
+//! us to acknowledge ([`Session::ack_disable`]) once we've stopped using
+//! them. Switching back *enables* it again.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -13,11 +18,55 @@ use std::rc::Rc;
 use anyhow::{Result, anyhow};
 use libseat::{Seat, SeatEvent};
 
+/// A change in whether the session is ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// Our VT is in the foreground: devices can be used again.
+    Enabled,
+    /// Switched away: stop using devices, then [`Session::ack_disable`].
+    Disabled,
+}
+
+/// What the seat's events mean for us: whether the session is ours, and
+/// whether a disable still needs acknowledging. Kept apart from libseat so
+/// it can be tested.
+#[derive(Debug, Default)]
+struct State {
+    active: bool,
+    awaiting_ack: bool,
+}
+
+impl State {
+    fn event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Enabled => {
+                self.active = true;
+                self.awaiting_ack = false;
+            }
+            SessionEvent::Disabled => {
+                self.active = false;
+                self.awaiting_ack = true;
+            }
+        }
+    }
+
+    /// Whether an acknowledgement is due (and now given).
+    fn ack(&mut self) -> bool {
+        std::mem::take(&mut self.awaiting_ack)
+    }
+}
+
 pub struct Session {
     /// Open devices, by the raw number of the fd handed out for each.
     devices: Vec<(RawFd, libseat::Device)>,
     seat: Seat,
     seat_fd: RawFd,
+    /// Events from the seat's callback, not yet returned by `dispatch`.
+    events: Rc<RefCell<Vec<SessionEvent>>>,
+    state: State,
+    /// Shared with [`crate::kms::Display`]: whether we still hold the
+    /// display. Drops as soon as the seat says so, before the front end
+    /// has handled the event.
     active: Rc<Cell<bool>>,
 }
 
@@ -26,17 +75,17 @@ impl Session {
     /// in the foreground).
     pub fn open() -> Result<Self> {
         let active = Rc::new(Cell::new(false));
-        let flag = active.clone();
-        let mut seat = Seat::open(move |seat, event| match event {
-            SeatEvent::Enable => flag.set(true),
-            SeatEvent::Disable => {
-                // We must stop touching devices and acknowledge. Callers see
-                // the flag drop and must not issue KMS commits afterwards.
-                flag.set(false);
-                if let Err(e) = seat.disable() {
-                    tracing::error!("libseat_disable_seat failed: {e:?}");
-                }
-            }
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (flag, queue) = (active.clone(), events.clone());
+        // Only record here: acknowledging a disable waits until the front
+        // end has stopped using the devices.
+        let mut seat = Seat::open(move |_seat, event| {
+            let event = match event {
+                SeatEvent::Enable => SessionEvent::Enabled,
+                SeatEvent::Disable => SessionEvent::Disabled,
+            };
+            flag.set(event == SessionEvent::Enabled);
+            queue.borrow_mut().push(event);
         })
         .map_err(|e| anyhow!("could not open seat via libseat: {e:?}"))?;
 
@@ -45,17 +94,22 @@ impl Session {
             .map_err(|e| anyhow!("libseat_get_fd: {e:?}"))?
             .as_raw_fd();
 
-        while !active.get() {
-            seat.dispatch(-1)
-                .map_err(|e| anyhow!("libseat_dispatch: {e:?}"))?;
-        }
-
-        Ok(Self {
+        let mut session = Self {
             devices: Vec::new(),
             seat,
             seat_fd,
+            events,
+            state: State::default(),
             active,
-        })
+        };
+        while !session.state.active {
+            session
+                .seat
+                .dispatch(-1)
+                .map_err(|e| anyhow!("libseat_dispatch: {e:?}"))?;
+            session.take_events();
+        }
+        Ok(session)
     }
 
     /// Open a device through the seat. The returned fd is a dup of the seat's
@@ -107,11 +161,40 @@ impl Session {
         self.seat.name().to_owned()
     }
 
-    /// Process pending seat events (enable/disable).
-    pub fn dispatch(&mut self) -> Result<()> {
+    /// Process pending seat events, and return them in order. After a
+    /// [`SessionEvent::Disabled`], stop using the devices and call
+    /// [`Session::ack_disable`].
+    pub fn dispatch(&mut self) -> Result<Vec<SessionEvent>> {
         self.seat
             .dispatch(0)
             .map_err(|e| anyhow!("libseat_dispatch: {e:?}"))?;
+        Ok(self.take_events())
+    }
+
+    fn take_events(&mut self) -> Vec<SessionEvent> {
+        let events = std::mem::take(&mut *self.events.borrow_mut());
+        for &e in &events {
+            self.state.event(e);
+        }
+        events
+    }
+
+    /// Tell the seat we've stopped using the devices, so the switch can
+    /// go ahead. Does nothing unless a disable is waiting for it.
+    pub fn ack_disable(&mut self) -> Result<()> {
+        if self.state.ack() {
+            self.seat
+                .disable()
+                .map_err(|e| anyhow!("libseat_disable_seat: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Ask the seat to switch to session (VT) `n`.
+    pub fn switch_session(&mut self, n: i32) -> Result<()> {
+        self.seat
+            .switch_session(n)
+            .map_err(|e| anyhow!("libseat_switch_session({n}): {e:?}"))?;
         Ok(())
     }
 
@@ -120,8 +203,9 @@ impl Session {
         unsafe { BorrowedFd::borrow_raw(self.seat_fd) }
     }
 
+    /// Whether the session is ours, as of the events returned so far.
     pub fn active(&self) -> bool {
-        self.active.get()
+        self.state.active
     }
 
     /// Shared view of the active flag, for code that must stop touching KMS
@@ -139,5 +223,32 @@ impl Drop for Session {
             }
         }
         // Dropping `seat` closes it, which releases the VT back to text mode.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disable_waits_for_one_acknowledgement() {
+        let mut s = State::default();
+        assert!(!s.ack(), "nothing to acknowledge yet");
+        s.event(SessionEvent::Enabled);
+        assert!(s.active);
+        s.event(SessionEvent::Disabled);
+        assert!(!s.active);
+        assert!(s.ack());
+        assert!(!s.ack(), "only once");
+        s.event(SessionEvent::Enabled);
+        assert!(s.active && !s.ack());
+    }
+
+    #[test]
+    fn enabling_drops_an_unsent_acknowledgement() {
+        let mut s = State::default();
+        s.event(SessionEvent::Disabled);
+        s.event(SessionEvent::Enabled);
+        assert!(!s.ack());
     }
 }

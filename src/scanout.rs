@@ -159,7 +159,7 @@ pub fn queue_frame(
     display: &mut kms::Display,
     buf: &mut Buffer,
     draw: impl FnOnce(&mut vk::Recorder, &Arc<vk::DmaBufImage>) -> Result<()>,
-) -> Result<()> {
+) -> Result<kms::Flip> {
     let fence = render(buf, draw)?;
     display.flip(&buf.fb, fence.as_ref())
 }

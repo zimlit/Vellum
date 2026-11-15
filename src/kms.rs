@@ -501,8 +501,110 @@ impl SavedState {
     }
 }
 
+/// A commit refused because we aren't DRM master.
+fn lost_master(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+/// Show `fb` full-screen on `output`'s primary plane, setting the mode,
+/// and switch off any other plane on the CRTC (a compositor on another VT
+/// may have left a cursor or overlay plane there). Test-only first, so a
+/// rejected configuration fails before anything on screen changes.
+fn modeset(card: &Card, output: &Output, fb: &Framebuffer) -> Result<()> {
+    let conn_props = Props::load(card, output.connector)?;
+    let crtc_props = Props::load(card, output.crtc)?;
+    let plane_props = &output.plane_props;
+    let (w, h) = output.mode.size();
+    let (w, h) = (u64::from(w), u64::from(h));
+
+    let mode_blob = create_mode_blob(card, &output.mode)?;
+    let mut req = AtomicModeReq::new();
+    req.add_property(
+        output.connector,
+        conn_props.handle("CRTC_ID")?,
+        property::Value::CRTC(Some(output.crtc)),
+    );
+    req.add_property(
+        output.crtc,
+        crtc_props.handle("MODE_ID")?,
+        property::Value::Blob(mode_blob),
+    );
+    req.add_property(
+        output.crtc,
+        crtc_props.handle("ACTIVE")?,
+        property::Value::Boolean(true),
+    );
+    let p = output.plane;
+    req.add_property(
+        p,
+        plane_props.handle("FB_ID")?,
+        property::Value::Framebuffer(Some(fb.handle)),
+    );
+    req.add_property(
+        p,
+        plane_props.handle("CRTC_ID")?,
+        property::Value::CRTC(Some(output.crtc)),
+    );
+    // Source rectangle is in 16.16 fixed point, destination in pixels.
+    req.add_property(p, plane_props.handle("SRC_X")?, raw(0));
+    req.add_property(p, plane_props.handle("SRC_Y")?, raw(0));
+    req.add_property(p, plane_props.handle("SRC_W")?, raw(w << 16));
+    req.add_property(p, plane_props.handle("SRC_H")?, raw(h << 16));
+    req.add_property(
+        p,
+        plane_props.handle("CRTC_X")?,
+        property::Value::SignedRange(0),
+    );
+    req.add_property(
+        p,
+        plane_props.handle("CRTC_Y")?,
+        property::Value::SignedRange(0),
+    );
+    req.add_property(p, plane_props.handle("CRTC_W")?, raw(w));
+    req.add_property(p, plane_props.handle("CRTC_H")?, raw(h));
+    for other in other_planes_on(card, output)? {
+        let props = Props::load(card, other)?;
+        tracing::debug!(plane = ?other, "switching off a plane left on our CRTC");
+        req.add_property(
+            other,
+            props.handle("FB_ID")?,
+            property::Value::Framebuffer(None),
+        );
+        req.add_property(other, props.handle("CRTC_ID")?, property::Value::CRTC(None));
+    }
+
+    let result = card
+        .atomic_commit(
+            AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+            req.clone(),
+        )
+        .context("atomic test commit rejected")
+        .and_then(|()| {
+            card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+                .context("atomic commit")
+        });
+    // The committed state holds its own reference to the blob.
+    let _ = card.destroy_property_blob(mode_blob);
+    result
+}
+
+/// Planes other than `output`'s primary that are on its CRTC.
+fn other_planes_on(card: &Card, output: &Output) -> Result<Vec<plane::Handle>> {
+    let mut planes = Vec::new();
+    for handle in card.plane_handles().context("listing planes")? {
+        if handle != output.plane && card.get_plane(handle)?.crtc() == Some(output.crtc) {
+            planes.push(handle);
+        }
+    }
+    Ok(planes)
+}
+
 /// Ownership of an output's CRTC. Created by committing a framebuffer to it;
 /// dropping it restores whatever was there before (typically fbcon).
+///
+/// While the session is away on another VT the display is paused: flips are
+/// refused, and [`Display::resume`] modesets again on return, since the
+/// other VT's owner will have changed the CRTC.
 pub struct Display<'a> {
     card: &'a Card,
     crtc: crtc::Handle,
@@ -510,8 +612,18 @@ pub struct Display<'a> {
     fb_id_prop: property::Handle,
     in_fence_prop: Option<property::Handle>,
     flip_pending: bool,
+    paused: bool,
     saved: SavedState,
     session_active: Rc<Cell<bool>>,
+}
+
+/// Whether a flip was queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flip {
+    Queued,
+    /// We're no longer DRM master (the seat took it for a VT switch, ahead
+    /// of telling us): the display is paused.
+    Lost,
 }
 
 impl<'a> Display<'a> {
@@ -524,92 +636,50 @@ impl<'a> Display<'a> {
         session_active: Rc<Cell<bool>>,
     ) -> Result<Self> {
         let saved = SavedState::capture(card, output).context("saving CRTC state")?;
-
-        let conn_props = Props::load(card, output.connector)?;
-        let crtc_props = Props::load(card, output.crtc)?;
-        let plane_props = &output.plane_props;
-        let (w, h) = output.mode.size();
-        let (w, h) = (u64::from(w), u64::from(h));
-
-        let mode_blob = create_mode_blob(card, &output.mode)?;
-        let mut req = AtomicModeReq::new();
-        req.add_property(
-            output.connector,
-            conn_props.handle("CRTC_ID")?,
-            property::Value::CRTC(Some(output.crtc)),
-        );
-        req.add_property(
-            output.crtc,
-            crtc_props.handle("MODE_ID")?,
-            property::Value::Blob(mode_blob),
-        );
-        req.add_property(
-            output.crtc,
-            crtc_props.handle("ACTIVE")?,
-            property::Value::Boolean(true),
-        );
-        let p = output.plane;
-        req.add_property(
-            p,
-            plane_props.handle("FB_ID")?,
-            property::Value::Framebuffer(Some(fb.handle)),
-        );
-        req.add_property(
-            p,
-            plane_props.handle("CRTC_ID")?,
-            property::Value::CRTC(Some(output.crtc)),
-        );
-        // Source rectangle is in 16.16 fixed point, destination in pixels.
-        req.add_property(p, plane_props.handle("SRC_X")?, raw(0));
-        req.add_property(p, plane_props.handle("SRC_Y")?, raw(0));
-        req.add_property(p, plane_props.handle("SRC_W")?, raw(w << 16));
-        req.add_property(p, plane_props.handle("SRC_H")?, raw(h << 16));
-        req.add_property(
-            p,
-            plane_props.handle("CRTC_X")?,
-            property::Value::SignedRange(0),
-        );
-        req.add_property(
-            p,
-            plane_props.handle("CRTC_Y")?,
-            property::Value::SignedRange(0),
-        );
-        req.add_property(p, plane_props.handle("CRTC_W")?, raw(w));
-        req.add_property(p, plane_props.handle("CRTC_H")?, raw(h));
-
-        // TEST_ONLY first so a rejected configuration fails before anything
-        // on screen changes.
-        let result = card
-            .atomic_commit(
-                AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
-                req.clone(),
-            )
-            .context("atomic test commit rejected")
-            .and_then(|()| {
-                card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-                    .context("atomic commit")
-            });
-        // The committed state holds its own reference to the blob.
-        let _ = card.destroy_property_blob(mode_blob);
-        result?;
-
+        modeset(card, output, fb)?;
         Ok(Self {
             card,
             crtc: output.crtc,
             plane: output.plane,
-            fb_id_prop: plane_props.handle("FB_ID")?,
-            in_fence_prop: plane_props.handle("IN_FENCE_FD").ok(),
+            fb_id_prop: output.plane_props.handle("FB_ID")?,
+            in_fence_prop: output.plane_props.handle("IN_FENCE_FD").ok(),
             flip_pending: false,
+            paused: false,
             saved,
             session_active,
         })
+    }
+
+    /// Stop using the display: the session is going away. A pending flip
+    /// is forgotten, since its event may never arrive.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.flip_pending = false;
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Back from another VT: modeset again to show `fb`. The state saved at
+    /// take-over stays what's restored at exit.
+    pub fn resume(&mut self, output: &Output, fb: &Framebuffer) -> Result<()> {
+        modeset(self.card, output, fb).context("modeset after resuming")?;
+        self.paused = false;
+        self.flip_pending = false;
+        Ok(())
     }
 
     /// Queue `fb` to be shown at the next vblank, without blocking. If
     /// `in_fence` (a sync_file) is given, the kernel waits for it to signal
     /// before scanning out. Completion is reported by a page-flip event; see
     /// [`Display::dispatch_events`]. Only one flip may be pending at a time.
-    pub fn flip(&mut self, fb: &Framebuffer, in_fence: Option<&OwnedFd>) -> Result<()> {
+    ///
+    /// Returns [`Flip::Lost`] (and pauses) if DRM master is gone.
+    pub fn flip(&mut self, fb: &Framebuffer, in_fence: Option<&OwnedFd>) -> Result<Flip> {
+        if self.paused {
+            bail!("flip while the display is paused");
+        }
         if self.flip_pending {
             bail!("a page flip is already pending");
         }
@@ -631,14 +701,22 @@ impl<'a> Display<'a> {
                 property::Value::SignedRange(i64::from(fence.as_raw_fd())),
             );
         }
-        self.card
-            .atomic_commit(
-                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
-                req,
-            )
-            .context("page flip commit")?;
-        self.flip_pending = true;
-        Ok(())
+        let result = self.card.atomic_commit(
+            AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+            req,
+        );
+        match result {
+            Ok(()) => {
+                self.flip_pending = true;
+                Ok(Flip::Queued)
+            }
+            Err(e) if lost_master(&e) => {
+                tracing::debug!("page flip refused ({e}): DRM master is gone; pausing");
+                self.pause();
+                Ok(Flip::Lost)
+            }
+            Err(e) => Err(e).context("page flip commit"),
+        }
     }
 
     /// Read pending DRM events from the card fd (call when it's readable).
@@ -653,6 +731,8 @@ impl<'a> Display<'a> {
                 flipped = true;
             }
         }
+        // A flip from before a pause doesn't count: resume modesets anew.
+        let flipped = flipped && !self.paused;
         if flipped {
             self.flip_pending = false;
         }
@@ -692,8 +772,8 @@ impl Drop for Display<'_> {
     fn drop(&mut self) {
         // If the session was disabled we no longer hold DRM master; whoever
         // owns the VT now owns the display.
-        if !self.session_active.get() {
-            tracing::debug!("session inactive; leaving display state to the new VT owner");
+        if !self.session_active.get() || self.paused {
+            tracing::debug!("not showing (another VT owns the display); leaving its state alone");
             return;
         }
         if let Err(e) = self.wait_for_pending_flip() {
@@ -885,6 +965,27 @@ mod tests {
         let (w, h) = output.mode.size();
         assert!(w > 0 && h > 0);
         assert!(!output.connector_name.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn other_planes_are_those_on_our_crtc() {
+        let card = testutil::card();
+        // Atomic implies universal planes: cursor and primary planes are
+        // listed too, as when vellum runs.
+        drm::Device::set_client_capability(&card, drm::ClientCapability::Atomic, true).unwrap();
+        let output = select_output(&card).unwrap();
+        let others = other_planes_on(&card, &output).unwrap();
+        assert!(!others.contains(&output.plane), "never our own plane");
+        for p in &others {
+            assert_eq!(card.get_plane(*p).unwrap().crtc(), Some(output.crtc));
+        }
+        // Whatever isn't listed isn't on our CRTC.
+        for p in card.plane_handles().unwrap() {
+            if p != output.plane && !others.contains(&p) {
+                assert_ne!(card.get_plane(p).unwrap().crtc(), Some(output.crtc));
+            }
+        }
     }
 
     #[test]

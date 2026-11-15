@@ -32,11 +32,11 @@ use crate::event::Poller;
 use crate::font::{Face, FontSet, fontconfig};
 use crate::input::{Binding, Devices, Key, KeyRepeat, Keyboard, Scroll};
 use crate::keys::{self, KeyEvent, KeyKind, KeyModes};
-use crate::kms::{self, Card};
+use crate::kms::{self, Card, Flip};
 use crate::scanout::{
     self, create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
 };
-use crate::session::Session;
+use crate::session::{Session, SessionEvent};
 use crate::signals::{self, SignalFd};
 use crate::term::Terminal;
 use crate::text::{self, TextRenderer};
@@ -131,7 +131,7 @@ pub fn run(args: Args) -> Result<()> {
         gpu = device.name(),
         "display taken over; running {}",
         match args.seconds {
-            0 => "until Ctrl+Alt+Backspace, SIGTERM or VT switch".to_owned(),
+            0 => "until Ctrl+Alt+Backspace or SIGTERM".to_owned(),
             s => format!("for {s}s"),
         }
     );
@@ -192,11 +192,29 @@ pub fn run(args: Args) -> Result<()> {
                     }
                 }
                 SEAT => {
-                    session.borrow_mut().dispatch()?;
-                    if !session.borrow().active() {
-                        // VT switching proper is roadmap step 7; for now just leave.
-                        tracing::info!("session disabled (VT switched away), exiting");
-                        break 'events;
+                    let events = session.borrow_mut().dispatch()?;
+                    for event in events {
+                        match event {
+                            SessionEvent::Disabled => {
+                                // Stop using the devices, then let the
+                                // switch go ahead. The shell keeps running
+                                // and its output keeps being read.
+                                display.pause();
+                                flip_pending = false;
+                                session.borrow_mut().ack_disable()?;
+                                tracing::info!("session disabled (switched to another VT)");
+                            }
+                            SessionEvent::Enabled => {
+                                // Show the last frame again, then redraw:
+                                // the screen may have changed while away.
+                                display
+                                    .resume(&output, &buffers[shown].fb)
+                                    .context("taking the display back")?;
+                                flip_pending = false;
+                                dirty = true;
+                                tracing::info!("session enabled (back on our VT)");
+                            }
+                        }
                     }
                 }
                 CARD => {
@@ -287,14 +305,18 @@ pub fn run(args: Args) -> Result<()> {
         }
 
         let held = sync_since.is_some_and(|since| since.elapsed() < SYNC_TIMEOUT);
-        if dirty && !flip_pending && !held {
+        if dirty && !flip_pending && !held && !display.paused() {
             let slot = next;
-            queue_frame(&mut display, &mut buffers[slot], |rec, image| {
+            let flip = queue_frame(&mut display, &mut buffers[slot], |rec, image| {
                 text.draw(rec, image, slot, &term)
             })?;
-            flip_pending = true;
-            dirty = false;
-            frames += 1;
+            // Lost: the seat took DRM master for a switch and its event is
+            // on the way. The frame is drawn again after resuming.
+            if flip == Flip::Queued {
+                flip_pending = true;
+                dirty = false;
+                frames += 1;
+            }
         }
     }
 
