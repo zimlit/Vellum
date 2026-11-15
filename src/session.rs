@@ -5,15 +5,17 @@
 //! hold the session (and puts it back when we release it).
 
 use std::cell::Cell;
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use libseat::{Seat, SeatEvent};
 
 pub struct Session {
-    devices: Vec<libseat::Device>,
+    /// Open devices, by the raw number of the fd handed out for each.
+    devices: Vec<(RawFd, libseat::Device)>,
     seat: Seat,
     seat_fd: RawFd,
     active: Rc<Cell<bool>>,
@@ -58,17 +60,51 @@ impl Session {
 
     /// Open a device through the seat. The returned fd is a dup of the seat's
     /// fd (same open file description, so revocation still applies to it).
+    /// The device stays open until [`Session::close_device`] or the session
+    /// is dropped.
     pub fn open_device(&mut self, path: &Path) -> Result<OwnedFd> {
+        self.open_device_io(path)
+            .map_err(|e| anyhow!("libseat_open_device({}): {e}", path.display()))
+    }
+
+    /// [`Session::open_device`] with the errno kept, for libinput.
+    pub fn open_device_io(&mut self, path: &Path) -> io::Result<OwnedFd> {
         let dev = self
             .seat
             .open_device(&path)
-            .map_err(|e| anyhow!("libseat_open_device({}): {e:?}", path.display()))?;
-        let fd = dev
-            .as_fd()
-            .try_clone_to_owned()
-            .context("dup of seat device fd")?;
-        self.devices.push(dev);
+            .map_err(|e| io::Error::from_raw_os_error(e.0))?;
+        let fd = match dev.as_fd().try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = self.seat.close_device(dev);
+                return Err(e);
+            }
+        };
+        // The number is unique while `fd` is open, which it is until
+        // `close_device` takes it back.
+        self.devices.push((fd.as_raw_fd(), dev));
         Ok(fd)
+    }
+
+    /// Close a device opened with [`Session::open_device`], given the fd it
+    /// returned.
+    pub fn close_device(&mut self, fd: OwnedFd) {
+        let raw = fd.as_raw_fd();
+        drop(fd);
+        match self.devices.iter().position(|&(n, _)| n == raw) {
+            Some(i) => {
+                let (_, dev) = self.devices.swap_remove(i);
+                if let Err(e) = self.seat.close_device(dev) {
+                    tracing::warn!("libseat_close_device failed: {e:?}");
+                }
+            }
+            None => tracing::warn!(fd = raw, "closing a device the seat didn't open"),
+        }
+    }
+
+    /// The seat's name (`seat0`), which libinput needs to find its devices.
+    pub fn seat_name(&mut self) -> String {
+        self.seat.name().to_owned()
     }
 
     /// Process pending seat events (enable/disable).
@@ -97,7 +133,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        for dev in self.devices.drain(..) {
+        for (_, dev) in self.devices.drain(..) {
             if let Err(e) = self.seat.close_device(dev) {
                 tracing::warn!("libseat_close_device failed: {e:?}");
             }

@@ -10,12 +10,18 @@
 //! demand; the front end attaches, gets the PTY master, and feeds what the
 //! shell prints to the terminal core ([`crate::term`]).
 //!
+//! Keys come from libinput through the seat, go through the xkb keymap
+//! ([`crate::input`]) and the key encoder ([`crate::keys`]), and are
+//! written to the PTY along with the terminal's replies.
+//!
 //! Frames are drawn only when the screen changed and no flip is in flight;
 //! the flip-completion event frees the other buffer for the next frame.
 //! While a program has synchronized output on (DECSET 2026), frames wait
 //! until it's turned off, or [`SYNC_TIMEOUT`] passes.
 
+use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -24,6 +30,8 @@ use rustix::io::Errno;
 use crate::cli::Args;
 use crate::event::Poller;
 use crate::font::{Face, FontSet, fontconfig};
+use crate::input::{Binding, Devices, Key, KeyRepeat, Keyboard};
+use crate::keys::{self, KeyEvent, KeyKind, KeyModes};
 use crate::kms::{self, Card};
 use crate::scanout::{
     self, create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
@@ -45,6 +53,8 @@ const SEAT: u64 = 0;
 const SIGNALS: u64 = 1;
 const CARD: u64 = 2;
 const PTY: u64 = 3;
+const INPUT: u64 = 4;
+const REPEAT: u64 = 5;
 
 pub fn run(args: Args) -> Result<()> {
     // Before any threads exist, so they all inherit the blocked mask.
@@ -58,8 +68,9 @@ pub fn run(args: Args) -> Result<()> {
         return probe(&card, &args);
     }
 
-    let mut session = Session::open()?;
-    let card = Card::new(session.open_device(&path)?);
+    // Shared with libinput, which opens input devices through it.
+    let session = Rc::new(RefCell::new(Session::open()?));
+    let card = Card::new(session.borrow_mut().open_device(&path)?);
     let output = prepare(&card)?;
     let font = load_font(&args.font, output.dpi())?;
 
@@ -111,8 +122,8 @@ pub fn run(args: Args) -> Result<()> {
     // any pending flip lands), then GPU work is waited for and buffers, the
     // device, the card and finally the seat are released. This also holds
     // when unwinding from a panic.
-    let mut display =
-        kms::Display::take_over(&card, &output, &buffers[0].fb, session.active_flag())?;
+    let active = session.borrow().active_flag();
+    let mut display = kms::Display::take_over(&card, &output, &buffers[0].fb, active)?;
     let (w, h) = output.mode.size();
     tracing::info!(
         connector = %output.connector_name,
@@ -120,7 +131,7 @@ pub fn run(args: Args) -> Result<()> {
         gpu = device.name(),
         "display taken over; running {}",
         match args.seconds {
-            0 => "until SIGTERM or VT switch".to_owned(),
+            0 => "until Ctrl+Alt+Backspace, SIGTERM or VT switch".to_owned(),
             s => format!("for {s}s"),
         }
     );
@@ -135,14 +146,21 @@ pub fn run(args: Args) -> Result<()> {
     let mut sync_since: Option<Instant> = None;
     let mut frames = 1u64;
 
+    let mut keyboard = Keyboard::new(&args.keymap)?;
+    let mut repeat = KeyRepeat::new().context("creating the key repeat timer")?;
+    // Dropped first, closing the input devices while the seat is still ours.
+    let mut devices = Devices::new(session.clone()).context("starting libinput")?;
+
     let mut poller = Poller::new().context("creating epoll instance")?;
-    poller.add(session.fd(), SEAT)?;
+    poller.add(session.borrow().fd(), SEAT)?;
     poller.add(&signals, SIGNALS)?;
     poller.add(&card, CARD)?;
     poller.add(&shell.master, PTY)?;
+    poller.add(&devices, INPUT)?;
+    poller.add(&repeat, REPEAT)?;
     let mut ready = Vec::new();
     let mut pty_buf = vec![0u8; 64 * 1024];
-    // What goes to the shell (replies to its queries; keys from step 6C),
+    // What goes to the shell (keys, and replies to its queries),
     // and whether the PTY is watched for room to write the rest.
     let mut to_shell = pty::Writer::default();
     let mut watching_writable = false;
@@ -174,8 +192,8 @@ pub fn run(args: Args) -> Result<()> {
                     }
                 }
                 SEAT => {
-                    session.dispatch()?;
-                    if !session.active() {
+                    session.borrow_mut().dispatch()?;
+                    if !session.borrow().active() {
                         // VT switching proper is roadmap step 7; for now just leave.
                         tracing::info!("session disabled (VT switched away), exiting");
                         break 'events;
@@ -215,6 +233,38 @@ pub fn run(args: Args) -> Result<()> {
                         break 'events;
                     }
                 },
+                INPUT => {
+                    let mut keys = Vec::new();
+                    devices
+                        .dispatch(|key| keys.push(key))
+                        .context("reading input events")?;
+                    for Key { code, pressed } in keys {
+                        let kind = if pressed {
+                            repeat.press(code, keyboard.repeats(code))
+                        } else {
+                            repeat.release(code)
+                        };
+                        kind.context("setting the key repeat timer")?;
+                        let kind = if pressed {
+                            KeyKind::Press
+                        } else {
+                            KeyKind::Release
+                        };
+                        if let Some(event) = keyboard.key(code, kind)
+                            && on_key(&event, &term, &mut to_shell, &shell.master)?
+                        {
+                            break 'events;
+                        }
+                    }
+                }
+                REPEAT => {
+                    if let Some(code) = repeat.expired().context("reading the repeat timer")?
+                        && let Some(event) = keyboard.key(code, KeyKind::Repeat)
+                        && on_key(&event, &term, &mut to_shell, &shell.master)?
+                    {
+                        break 'events;
+                    }
+                }
                 _ => unreachable!("unknown event token {token}"),
             }
         }
@@ -254,6 +304,35 @@ pub fn run(args: Args) -> Result<()> {
         tracing::warn!("asking the session server to close the shell: {e}");
     }
     Ok(())
+}
+
+/// Handle one key: vellum's own bindings, else encode it and queue it for
+/// the shell. Returns whether to exit.
+fn on_key(
+    event: &KeyEvent,
+    term: &Terminal,
+    to_shell: &mut pty::Writer,
+    master: &OwnedFd,
+) -> Result<bool> {
+    match crate::input::binding(event) {
+        Some(Binding::Exit) if event.kind == KeyKind::Press => {
+            tracing::info!("exiting on Ctrl+Alt+Backspace");
+            return Ok(true);
+        }
+        Some(Binding::SwitchVt(n)) if event.kind == KeyKind::Press => {
+            tracing::info!(vt = n, "Ctrl+Alt+F{n}: VT switching is step 7; ignored");
+            return Ok(false);
+        }
+        Some(_) => return Ok(false),
+        None => {}
+    }
+    if let Some(bytes) = keys::encode(event, &KeyModes::of(term)) {
+        tracing::trace!(target: "vellum::pty", "key {:?}: {}", event.sym, bytes.escape_ascii());
+        to_shell
+            .send(master, &bytes)
+            .context("writing to the PTY")?;
+    }
+    Ok(false)
 }
 
 /// Read what the shell wrote into `buf`: `Some(bytes read)` (0 if nothing
