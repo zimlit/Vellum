@@ -492,7 +492,7 @@ fn osc_title_and_colors() {
     );
     t.feed(b"\x1b]111\x07");
     assert_eq!(t.palette().background, Palette::default().background);
-    // Queries need replies: ignored for now, nothing changes.
+    // A query changes nothing (its reply is tested in `osc_color_queries`).
     t.feed(b"\x1b]10;?\x07\x1b]4;1;?\x07");
     assert_eq!(t.palette().foreground, [0x10, 0x20, 0x30]);
 }
@@ -502,7 +502,7 @@ fn unhandled_sequences_are_harmless() {
     let t = term(
         20,
         2,
-        "a\x1b[c\x1b[>c\x1b[6n\x1b[?1$p\x1b[?u\x1b[18t\x1bP+q544e\x1b\\\x1b]777;x\x07\
+        "a\x1b[?9999$p\x1b[3t\x1bP!|x\x1b\\\x1b]777;x\x07\
          \x1b[?9999h\x1b[73m\x1b%Gb\x1b_kitty\x1b\\c",
     );
     assert_eq!(text(&t), ["abc"]);
@@ -545,5 +545,205 @@ fn splitting_the_input_changes_nothing() {
             whole,
             "split at {split}"
         );
+    }
+}
+
+// Replies.
+
+/// Feed `input` and return the replies it produced, as text.
+fn replies(t: &mut Terminal, input: &str) -> String {
+    t.feed(input.as_bytes());
+    String::from_utf8(t.take_replies()).unwrap()
+}
+
+#[test]
+fn device_attributes_and_version() {
+    let mut t = Terminal::new(10, 3);
+    assert_eq!(replies(&mut t, "\x1b[c"), "\x1b[?62;22c");
+    assert_eq!(replies(&mut t, "\x1b[0c"), "\x1b[?62;22c");
+    assert!(replies(&mut t, "\x1b[>c").starts_with("\x1b[>1;"));
+    assert!(replies(&mut t, "\x1b[>0q").starts_with("\x1bP>|vellum("));
+    assert_eq!(replies(&mut t, ""), "", "taking empties the queue");
+}
+
+#[test]
+fn device_status_reports() {
+    let mut t = Terminal::new(10, 5);
+    assert_eq!(replies(&mut t, "\x1b[5n"), "\x1b[0n");
+    assert_eq!(replies(&mut t, "\x1b[3;4H\x1b[6n"), "\x1b[3;4R");
+    assert_eq!(replies(&mut t, "\x1b[?6n"), "\x1b[?3;4;1R");
+    // Origin mode: relative to the scroll region.
+    assert_eq!(
+        replies(&mut t, "\x1b[2;4r\x1b[?6h\x1b[2;1H\x1b[6n"),
+        "\x1b[2;1R"
+    );
+    // Pending wrap: still on the last column.
+    let mut t = Terminal::new(4, 2);
+    assert_eq!(replies(&mut t, "abcd\x1b[6n"), "\x1b[1;4R");
+    // The default colors are light on dark; a light background says so.
+    assert_eq!(replies(&mut t, "\x1b[?996n"), "\x1b[?997;1n");
+    assert_eq!(
+        replies(&mut t, "\x1b]10;#000000\x07\x1b]11;#ffffff\x07\x1b[?996n"),
+        "\x1b[?997;2n"
+    );
+}
+
+#[test]
+fn mode_reports() {
+    let mut t = Terminal::new(10, 3);
+    assert_eq!(replies(&mut t, "\x1b[?7$p"), "\x1b[?7;1$y");
+    assert_eq!(replies(&mut t, "\x1b[?2026$p"), "\x1b[?2026;2$y");
+    assert_eq!(replies(&mut t, "\x1b[?2026h\x1b[?2026$p"), "\x1b[?2026;1$y");
+    assert_eq!(replies(&mut t, "\x1b[?1049h\x1b[?1049$p"), "\x1b[?1049;1$y");
+    assert_eq!(replies(&mut t, "\x1b[?1002h\x1b[?1000$p"), "\x1b[?1000;2$y");
+    assert_eq!(replies(&mut t, "\x1b[?1002$p"), "\x1b[?1002;1$y");
+    assert_eq!(replies(&mut t, "\x1b[?9999$p"), "\x1b[?9999;0$y");
+    // ANSI modes.
+    assert_eq!(replies(&mut t, "\x1b[4h\x1b[4$p"), "\x1b[4;1$y");
+    assert_eq!(replies(&mut t, "\x1b[20$p"), "\x1b[20;2$y");
+    assert_eq!(replies(&mut t, "\x1b[3$p"), "\x1b[3;0$y");
+}
+
+#[test]
+fn window_size_reports() {
+    let mut t = Terminal::new(80, 24);
+    assert_eq!(replies(&mut t, "\x1b[18t"), "\x1b[8;24;80t");
+    // Pixel sizes only once they're known.
+    assert_eq!(replies(&mut t, "\x1b[14t\x1b[16t"), "");
+    t.set_cell_pixels(10, 20);
+    assert_eq!(replies(&mut t, "\x1b[14t"), "\x1b[4;480;800t");
+    assert_eq!(replies(&mut t, "\x1b[16t"), "\x1b[6;20;10t");
+    // RIS keeps them.
+    assert_eq!(replies(&mut t, "\x1bc\x1b[16t"), "\x1b[6;20;10t");
+}
+
+#[test]
+fn osc_color_queries() {
+    let mut t = Terminal::new(10, 1);
+    t.feed(b"\x1b]10;#102030\x07\x1b]4;1;#ff0080\x07");
+    // Ended like the query: BEL or ST.
+    assert_eq!(
+        replies(&mut t, "\x1b]10;?\x07"),
+        "\x1b]10;rgb:1010/2020/3030\x07"
+    );
+    assert_eq!(
+        replies(&mut t, "\x1b]4;1;?\x1b\\"),
+        "\x1b]4;1;rgb:ffff/0000/8080\x1b\\"
+    );
+    // Several at once: OSC 10 with two arguments asks for 10 and 11.
+    let bg = Palette::default().background.map(|c| u16::from(c) * 0x101);
+    assert_eq!(
+        replies(&mut t, "\x1b]10;?;?\x07"),
+        format!(
+            "\x1b]10;rgb:1010/2020/3030\x07\x1b]11;rgb:{:04x}/{:04x}/{:04x}\x07",
+            bg[0], bg[1], bg[2]
+        )
+    );
+    // Setting and querying mixed in one OSC 4.
+    assert_eq!(
+        replies(&mut t, "\x1b]4;2;#000001;2;?\x07"),
+        "\x1b]4;2;rgb:0000/0000/0101\x07"
+    );
+}
+
+#[test]
+fn terminfo_capability_queries() {
+    let mut t = Terminal::new(10, 1);
+    // "TN" and "Co"; then an unknown name and a boolean.
+    assert_eq!(
+        replies(&mut t, "\x1bP+q544E;436F\x1b\\"),
+        "\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\\x1bP1+r436F=323536\x1b\\"
+    );
+    assert_eq!(
+        replies(&mut t, "\x1bP+q78797A;524742\x1b\\"),
+        "\x1bP0+r78797A\x1b\\\x1bP1+r524742\x1b\\"
+    );
+    // Not hex: unknown.
+    assert_eq!(replies(&mut t, "\x1bP+qzz\x1b\\"), "\x1bP0+rzz\x1b\\");
+    // Too long: dropped without a reply.
+    let long = format!("\x1bP+q{}\x1b\\", "4".repeat(5000));
+    assert_eq!(replies(&mut t, &long), "");
+    // Other DCS strings are still consumed quietly.
+    assert_eq!(replies(&mut t, "\x1bP1$tx\x1b\\"), "");
+    assert!(text(&t).is_empty(), "nothing printed");
+}
+
+#[test]
+fn setting_queries() {
+    let mut t = Terminal::new(10, 5);
+    assert_eq!(
+        replies(&mut t, "\x1b[1;4:3;38;5;100;48;2;1;2;3m\x1bP$qm\x1b\\"),
+        "\x1bP1$r0;1;4:3;38;5;100;48;2;1;2;3m\x1b\\"
+    );
+    assert_eq!(
+        replies(&mut t, "\x1b[2;4r\x1bP$qr\x1b\\"),
+        "\x1bP1$r2;4r\x1b\\"
+    );
+    assert_eq!(
+        replies(&mut t, "\x1b[6 q\x1bP$q q\x1b\\"),
+        "\x1bP1$r6 q\x1b\\"
+    );
+    assert_eq!(
+        replies(&mut t, "\x1b[3 q\x1bP$q q\x1b\\"),
+        "\x1bP1$r3 q\x1b\\"
+    );
+    assert_eq!(replies(&mut t, "\x1bP$q\"p\x1b\\"), "\x1bP1$r62;1\"p\x1b\\");
+    assert_eq!(replies(&mut t, "\x1bP$qx\x1b\\"), "\x1bP0$r\x1b\\");
+}
+
+#[test]
+fn kitty_keyboard_modes() {
+    let mut t = Terminal::new(10, 3);
+    assert_eq!(replies(&mut t, "\x1b[?u"), "\x1b[?0u");
+    t.feed(b"\x1b[>1u\x1b[>3u");
+    assert_eq!(t.keyboard_flags(), 3);
+    assert_eq!(replies(&mut t, "\x1b[=8;2u\x1b[?u"), "\x1b[?11u");
+    t.feed(b"\x1b[<u");
+    assert_eq!(t.keyboard_flags(), 1);
+
+    // The alternate screen has its own, starting off each time it's entered.
+    t.feed(b"\x1b[?1049h");
+    assert_eq!(t.keyboard_flags(), 0);
+    t.feed(b"\x1b[>31u");
+    assert_eq!(t.keyboard_flags(), 31);
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(t.keyboard_flags(), 1);
+    t.feed(b"\x1b[?1049h");
+    assert_eq!(t.keyboard_flags(), 0);
+    t.feed(b"\x1b[?1049l");
+
+    // CSI u alone still restores the cursor.
+    t.feed(b"\x1b[2;3H\x1b[s\x1b[H\x1b[u");
+    assert_eq!(cursor(&t), (2, 1));
+    // Resets clear the flags.
+    t.feed(b"\x1b[!p");
+    assert_eq!(t.keyboard_flags(), 0);
+    t.feed(b"\x1b[>5u\x1bc");
+    assert_eq!(t.keyboard_flags(), 0);
+}
+
+#[test]
+fn focus_events() {
+    let mut t = Terminal::new(10, 1);
+    t.focus(false);
+    assert!(t.take_replies().is_empty(), "not asked for");
+    t.feed(b"\x1b[?1004h");
+    t.focus(false);
+    t.focus(true);
+    assert_eq!(t.take_replies(), b"\x1b[O\x1b[I");
+}
+
+#[test]
+fn replies_survive_splits_in_order() {
+    let input = b"\x1b[c\x1b]11;?\x1b\\\x1bP+q544E\x1b\\\x1b[6n\x1b[?2026$p";
+    let mut whole = Terminal::new(10, 3);
+    whole.feed(input);
+    let expected = whole.take_replies();
+    assert!(!expected.is_empty());
+    for split in 0..=input.len() {
+        let mut t = Terminal::new(10, 3);
+        t.feed(&input[..split]);
+        t.feed(&input[split..]);
+        assert_eq!(t.take_replies(), expected, "split at {split}");
     }
 }

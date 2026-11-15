@@ -136,6 +136,59 @@ pub fn spawn(mut cmd: Command, size: WinSize) -> io::Result<Spawned> {
     Ok(Spawned { master, child })
 }
 
+/// Most bytes [`Writer`] holds for a program that isn't reading; more are
+/// dropped (with a warning) rather than growing without bound.
+const MAX_PENDING: usize = 1 << 20;
+
+/// Writes to a non-blocking PTY master, keeping what it can't take yet in
+/// order. When [`Writer::pending`], the owner waits for the fd to be
+/// writable and calls [`Writer::flush`].
+#[derive(Default)]
+pub struct Writer {
+    pending: Vec<u8>,
+}
+
+impl Writer {
+    /// Write `bytes` after anything still pending.
+    pub fn send(&mut self, fd: impl AsFd, bytes: &[u8]) -> io::Result<()> {
+        let room = MAX_PENDING - self.pending.len();
+        if bytes.len() > room {
+            tracing::warn!(
+                dropped = bytes.len() - room,
+                "the program isn't reading its input; dropping some"
+            );
+        }
+        self.pending
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        self.flush(fd)
+    }
+
+    /// Write as much of what's pending as the fd takes.
+    pub fn flush(&mut self, fd: impl AsFd) -> io::Result<()> {
+        let mut done = 0;
+        while done < self.pending.len() {
+            match rustix::io::write(&fd, &self.pending[done..]) {
+                Ok(n) => done += n,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                // The program is gone; the reader finds out the same way.
+                Err(rustix::io::Errno::IO) => done = self.pending.len(),
+                Err(e) => {
+                    self.pending.drain(..done);
+                    return Err(e.into());
+                }
+            }
+        }
+        self.pending.drain(..done);
+        Ok(())
+    }
+
+    /// Bytes are waiting for the fd to become writable.
+    pub fn pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
 /// The user's shell (`$SHELL`, else `/bin/sh`) with the [`terminal_env`].
 pub fn shell_command() -> Command {
     let shell = std::env::var_os("SHELL")
@@ -265,6 +318,37 @@ pub mod tests {
         assert!(has("TERM_PROGRAM", "vellum"));
         // Another terminal's markers are removed (None: unset).
         assert!(envs.contains(&("VTE_VERSION".as_ref(), None)));
+    }
+
+    #[test]
+    fn writer_keeps_what_the_pty_cannot_take() {
+        let (master, slave) = open().unwrap();
+        rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).unwrap();
+        rustix::fs::fcntl_setfl(&slave, rustix::fs::OFlags::NONBLOCK).unwrap();
+        // Raw mode: bytes pass through unchanged, and nothing echoes back.
+        let mut t = termios::tcgetattr(&slave).unwrap();
+        t.make_raw();
+        termios::tcsetattr(&slave, termios::OptionalActions::Now, &t).unwrap();
+
+        // More than the PTY buffers, with a recognizable pattern.
+        let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut w = Writer::default();
+        w.send(&master, &data[..100 * 1024]).unwrap();
+        assert!(w.pending(), "the slave hasn't read anything yet");
+        w.send(&master, &data[100 * 1024..]).unwrap();
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while got.len() < data.len() && Instant::now() < deadline {
+            match rustix::io::read(&slave, &mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(Errno::AGAIN) => w.flush(&master).unwrap(),
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert!(!w.pending());
+        assert!(got == data, "bytes arrived in order, all of them");
     }
 
     #[test]

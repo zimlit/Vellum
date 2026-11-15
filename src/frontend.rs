@@ -95,6 +95,10 @@ pub fn run(args: Args) -> Result<()> {
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, BUFFER_COUNT)?;
     let mut term = Terminal::new(cols, rows);
+    term.set_cell_pixels(
+        cell.width.min(u16::MAX.into()) as u16,
+        cell.height.min(u16::MAX.into()) as u16,
+    );
 
     // First frame: render, wait on the CPU, and modeset with it.
     let start = Instant::now();
@@ -138,6 +142,10 @@ pub fn run(args: Args) -> Result<()> {
     poller.add(&shell.master, PTY)?;
     let mut ready = Vec::new();
     let mut pty_buf = vec![0u8; 64 * 1024];
+    // What goes to the shell (replies to its queries; keys from step 6C),
+    // and whether the PTY is watched for room to write the rest.
+    let mut to_shell = pty::Writer::default();
+    let mut watching_writable = false;
     let mut shell_alive = true;
 
     let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
@@ -187,6 +195,13 @@ pub fn run(args: Args) -> Result<()> {
                     Some(0) => {}
                     Some(n) => {
                         term.feed(&pty_buf[..n]);
+                        let replies = term.take_replies();
+                        if !replies.is_empty() {
+                            tracing::trace!(target: "vellum::pty", "reply: {}", replies.escape_ascii());
+                            to_shell
+                                .send(&shell.master, &replies)
+                                .context("writing to the PTY")?;
+                        }
                         dirty = true;
                         if !term.synchronized() {
                             sync_since = None;
@@ -202,6 +217,18 @@ pub fn run(args: Args) -> Result<()> {
                 },
                 _ => unreachable!("unknown event token {token}"),
             }
+        }
+
+        // Finish queued writes once there's room, and watch for room only
+        // while something is queued (the PTY is nearly always writable).
+        if ready.contains(&PTY) && to_shell.pending() {
+            to_shell
+                .flush(&shell.master)
+                .context("writing to the PTY")?;
+        }
+        if to_shell.pending() != watching_writable {
+            watching_writable = to_shell.pending();
+            poller.watch_writable(&shell.master, PTY, watching_writable)?;
         }
 
         let held = sync_since.is_some_and(|since| since.elapsed() < SYNC_TIMEOUT);

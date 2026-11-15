@@ -90,10 +90,79 @@ fn extended(group: &[u16], rest: &mut Groups<'_>) -> Option<Color> {
     }
 }
 
+/// The SGR parameters that set a fresh pen to `pen` (for DECRQSS), always
+/// starting with `0`. Colors use the semicolon forms, which every program
+/// that reads them back understands; the underline color uses the colon
+/// form, its usual spelling.
+pub fn describe(pen: &Style) -> String {
+    let mut codes = vec!["0".to_owned()];
+    const FLAGS: [(Flags, &str); 8] = [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::BLINK, "5"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKE, "9"),
+        (Flags::OVERLINE, "53"),
+    ];
+    for (flag, code) in FLAGS {
+        if pen.flags.contains(flag) {
+            codes.push(code.to_owned());
+        }
+    }
+    match pen.underline {
+        Underline::None => {}
+        Underline::Single => codes.push("4".to_owned()),
+        Underline::Double => codes.push("4:2".to_owned()),
+        Underline::Curly => codes.push("4:3".to_owned()),
+        Underline::Dotted => codes.push("4:4".to_owned()),
+        Underline::Dashed => codes.push("4:5".to_owned()),
+    }
+    match pen.fg {
+        Color::Default => {}
+        Color::Indexed(i @ 0..8) => codes.push((30 + i).to_string()),
+        Color::Indexed(i @ 8..16) => codes.push((90 + i - 8).to_string()),
+        Color::Indexed(i) => codes.push(format!("38;5;{i}")),
+        Color::Rgb([r, g, b]) => codes.push(format!("38;2;{r};{g};{b}")),
+    }
+    match pen.bg {
+        Color::Default => {}
+        Color::Indexed(i @ 0..8) => codes.push((40 + i).to_string()),
+        Color::Indexed(i @ 8..16) => codes.push((100 + i - 8).to_string()),
+        Color::Indexed(i) => codes.push(format!("48;5;{i}")),
+        Color::Rgb([r, g, b]) => codes.push(format!("48;2;{r};{g};{b}")),
+    }
+    match pen.underline_color {
+        Color::Default => {}
+        Color::Indexed(i) => codes.push(format!("58:5:{i}")),
+        Color::Rgb([r, g, b]) => codes.push(format!("58:2::{r}:{g}:{b}")),
+    }
+    codes.join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::term::parser::{Parser, Perform};
+
+    #[test]
+    fn describe_round_trips() {
+        for params in [
+            "",
+            "1;3;4;7;9;53",
+            "2;5;8;4:3;31;42",
+            "97;100;4:2",
+            "38;5;196;48;2;1;2;3;58:2::4:5:6",
+            "58;5;9;4:5",
+        ] {
+            let s = style(params);
+            let described = describe(&s);
+            assert!(described.starts_with('0'), "{described}");
+            assert_eq!(style(&described), s, "{params} → {described}");
+        }
+        assert_eq!(describe(&style("1;31")), "0;1;31");
+    }
 
     /// Parse `CSI <params> m` and apply it to `pen`.
     fn sgr(pen: &mut Style, params: &str) -> Vec<u16> {

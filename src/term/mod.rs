@@ -3,14 +3,18 @@
 //!
 //! The behavior follows xterm where terminals differ, since that's what
 //! `TERM=xterm-256color` promises. Not handled yet: wide characters and
-//! combining marks (roadmap step 8), resize (the size is fixed), and
-//! anything that needs a reply to the program (DA, DSR, DECRQM, OSC color
-//! queries: step 6, together with keyboard input). Sequences that aren't
-//! handled are logged once each at debug level, target `vellum::term`.
+//! combining marks (roadmap step 8) and resize (the size is fixed).
+//! Sequences that aren't handled are logged once each at debug level,
+//! target `vellum::term`.
+//!
+//! Queries (device attributes, cursor position, modes, colors, terminfo
+//! capabilities, ...) are answered by queuing replies, which the owner
+//! sends to the program: see [`Terminal::take_replies`].
 
 pub mod cell;
 pub mod palette;
 pub mod parser;
+mod reply;
 pub mod screen;
 pub mod scrollback;
 mod sgr;
@@ -171,6 +175,23 @@ struct Saved {
 /// Most distinct unhandled sequences to log.
 const MAX_REPORTED: usize = 256;
 
+/// The DCS requests that are answered; their data is collected until the
+/// string ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DcsRequest {
+    /// `DCS $ q`: request a setting (DECRQSS).
+    Setting,
+    /// `DCS + q`: request terminfo capabilities (XTGETTCAP).
+    Capabilities,
+}
+
+struct Dcs {
+    request: DcsRequest,
+    data: Vec<u8>,
+    /// Longer than [`reply::MAX_DCS`]: not answered.
+    overflow: bool,
+}
+
 pub struct Terminal {
     parser: Parser,
     cols: u16,
@@ -194,6 +215,14 @@ pub struct Terminal {
     palette: Palette,
     /// For REP.
     last_printed: Option<char>,
+    /// Kitty keyboard protocol modes for the primary and alternate screens.
+    keyboard: [reply::KeyboardModes; 2],
+    /// The DCS string being collected, if it's one we answer.
+    dcs: Option<Dcs>,
+    /// Replies waiting to be sent to the program.
+    replies: Vec<u8>,
+    /// A cell's size in pixels, for window size reports (0: unknown).
+    cell_pixels: (u16, u16),
     /// Unhandled sequences already logged.
     reported: HashSet<String>,
 }
@@ -224,6 +253,10 @@ impl Terminal {
             title: String::new(),
             palette: Palette::default(),
             last_printed: None,
+            keyboard: Default::default(),
+            dcs: None,
+            replies: Vec::new(),
+            cell_pixels: (0, 0),
             reported: HashSet::new(),
         }
     }
@@ -233,6 +266,31 @@ impl Terminal {
         let mut parser = std::mem::take(&mut self.parser);
         parser.advance(self, bytes);
         self.parser = parser;
+    }
+
+    /// Take the replies to queries seen so far, to be written to the
+    /// program in order.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
+    }
+
+    /// Set a cell's size in pixels, for window size reports.
+    pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
+        self.cell_pixels = (width, height);
+    }
+
+    /// The terminal gained or lost focus: reported when the program asked
+    /// for focus events (1004).
+    pub fn focus(&mut self, focused: bool) {
+        if self.modes.focus_events {
+            self.replies
+                .extend_from_slice(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
+    /// The kitty keyboard protocol flags for the screen being shown.
+    pub fn keyboard_flags(&self) -> u8 {
+        self.keyboard[usize::from(self.alt)].flags
     }
 
     pub fn cols(&self) -> u16 {
@@ -527,9 +585,12 @@ impl Terminal {
         }
     }
 
+    /// Blank the alternate screen for its next user, who also starts with
+    /// the kitty keyboard flags off.
     fn clear_alternate(&mut self) {
         let rows = self.rows;
         self.alternate.erase_rows(0, rows, Cell::default());
+        self.keyboard[1] = Default::default();
     }
 
     /// DECSTR: the modes and cursor state, not the screen.
@@ -551,15 +612,21 @@ impl Terminal {
             ..Cursor::default()
         };
         self.saved = [None; 2];
+        self.keyboard = Default::default();
     }
 
-    /// RIS: back to the power-on state. The scrollback stays.
+    /// RIS: back to the power-on state. The scrollback stays, and so do
+    /// replies not yet sent.
     fn full_reset(&mut self) {
         let scrollback = std::mem::replace(&mut self.scrollback, Scrollback::new(0));
         let reported = std::mem::take(&mut self.reported);
+        let replies = std::mem::take(&mut self.replies);
+        let cell_pixels = self.cell_pixels;
         *self = Self::new(self.cols, self.rows);
         self.scrollback = scrollback;
         self.reported = reported;
+        self.replies = replies;
+        self.cell_pixels = cell_pixels;
     }
 
     /// DECALN: fill the screen with `E` (a test pattern).
@@ -668,9 +735,173 @@ impl Terminal {
         self.cursor_blink = blink;
     }
 
+    /// A DEC private mode's state for DECRQM: `Some(set)` for the modes
+    /// [`Self::set_private_mode`] knows, `None` for the rest.
+    fn private_mode(&self, mode: u16) -> Option<bool> {
+        let m = &self.modes;
+        Some(match mode {
+            1 => m.cursor_keys_app,
+            6 => m.origin,
+            7 => m.autowrap,
+            12 => self.cursor_blink,
+            25 => m.cursor_visible,
+            47 | 1047 | 1049 => self.alt,
+            66 => m.keypad_app,
+            1000 => m.mouse == MouseTracking::Click,
+            1002 => m.mouse == MouseTracking::Drag,
+            1003 => m.mouse == MouseTracking::Motion,
+            1004 => m.focus_events,
+            1005 => m.mouse_encoding == MouseEncoding::Utf8,
+            1006 => m.mouse_encoding == MouseEncoding::Sgr,
+            1015 => m.mouse_encoding == MouseEncoding::Urxvt,
+            // Saving the cursor isn't a state.
+            1048 => false,
+            2004 => m.bracketed_paste,
+            2026 => m.synchronized,
+            _ => return None,
+        })
+    }
+
+    fn ansi_mode(&self, mode: u16) -> Option<bool> {
+        match mode {
+            4 => Some(self.modes.insert),
+            20 => Some(self.modes.newline),
+            _ => None,
+        }
+    }
+
+    // Replies.
+
+    fn reply(&mut self, bytes: &[u8]) {
+        self.replies.extend_from_slice(bytes);
+    }
+
+    /// DECRQM (`CSI ? Ps $ p`, or `CSI Ps $ p` for ANSI modes): 0 for an
+    /// unknown mode, 1 set, 2 reset.
+    fn report_mode(&mut self, mode: u16, private: bool) {
+        let state = if private {
+            self.private_mode(mode)
+        } else {
+            self.ansi_mode(mode)
+        };
+        let value = match state {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        let marker = if private { "?" } else { "" };
+        self.reply(format!("\x1b[{marker}{mode};{value}$y").as_bytes());
+    }
+
+    /// DSR (`CSI n`) and its DEC form (`CSI ? n`).
+    fn device_status(&mut self, params: &Params, private: bool) {
+        // The cursor row as the program addresses it: relative to the
+        // scroll region in origin mode.
+        let row = if self.modes.origin {
+            self.cursor.row.saturating_sub(self.top)
+        } else {
+            self.cursor.row
+        } + 1;
+        let col = self.cursor.col + 1;
+        match (private, param(params, 0, 0)) {
+            (false, 5) => self.reply(b"\x1b[0n"),
+            // CPR.
+            (false, 6) => self.reply(format!("\x1b[{row};{col}R").as_bytes()),
+            // DECXCPR, with the page number.
+            (true, 6) => self.reply(format!("\x1b[?{row};{col};1R").as_bytes()),
+            // Color scheme: 1 dark, 2 light.
+            (true, 996) => {
+                let p = &self.palette;
+                let scheme = if reply::is_dark(p.foreground, p.background) {
+                    1
+                } else {
+                    2
+                };
+                self.reply(format!("\x1b[?997;{scheme}n").as_bytes());
+            }
+            _ => {
+                let marker = if private { &b"?"[..] } else { b"" };
+                self.unhandled(describe_csi(params, marker, b'n'));
+            }
+        }
+    }
+
+    /// Window operations (`CSI t`): only the size reports.
+    fn window_op(&mut self, params: &Params) {
+        let (cw, ch) = self.cell_pixels;
+        let known = cw > 0 && ch > 0;
+        let (cols, rows) = (u32::from(self.cols), u32::from(self.rows));
+        match param(params, 0, 0) {
+            // Text area in pixels.
+            14 if known => {
+                let (w, h) = (cols * u32::from(cw), rows * u32::from(ch));
+                self.reply(format!("\x1b[4;{h};{w}t").as_bytes());
+            }
+            // A cell in pixels.
+            16 if known => self.reply(format!("\x1b[6;{ch};{cw}t").as_bytes()),
+            // Text area in cells.
+            18 => self.reply(format!("\x1b[8;{rows};{cols}t").as_bytes()),
+            _ => self.unhandled(describe_csi(params, b"", b't')),
+        }
+    }
+
+    /// The kitty keyboard protocol's `CSI u` forms (`>`, `<`, `=`, `?`).
+    fn keyboard_mode(&mut self, params: &Params, marker: u8) {
+        let keyboard = &mut self.keyboard[usize::from(self.alt)];
+        let flags = (param(params, 0, 0) & 0xff) as u8;
+        match marker {
+            b'>' => keyboard.push(flags),
+            b'<' => keyboard.pop(param(params, 0, 1)),
+            b'=' => {
+                if !keyboard.set(flags, param(params, 1, 1)) {
+                    self.unhandled(describe_csi(params, b"=", b'u'));
+                }
+            }
+            _ => {
+                let flags = keyboard.flags;
+                self.reply(format!("\x1b[?{flags}u").as_bytes());
+            }
+        }
+    }
+
+    /// OSC color queries (`?` in place of a color): the color, in the
+    /// form OSC 4/10/11/12 would set it.
+    fn report_color(&mut self, prefix: &str, rgb: palette::Rgb, bell: bool) {
+        self.reply(&reply::osc_color(prefix, rgb, bell));
+    }
+
+    /// DECRQSS: `DCS 1 $ r <setting> ST` for the settings we have, or
+    /// `DCS 0 $ r ST`.
+    fn report_setting(&mut self, request: &[u8]) {
+        let setting = match request {
+            b"m" => Some(format!("{}m", sgr::describe(&self.cursor.pen))),
+            b"r" => Some(format!("{};{}r", self.top + 1, self.bottom)),
+            b" q" => {
+                let style = match self.cursor_shape {
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 3,
+                    CursorShape::Bar => 5,
+                } + u8::from(!self.cursor_blink);
+                Some(format!("{style} q"))
+            }
+            // Conformance level: VT200, 7-bit controls.
+            b"\"p" => Some("62;1\"p".to_owned()),
+            _ => None,
+        };
+        match setting {
+            Some(s) => self.reply(format!("\x1bP1$r{s}").as_bytes()),
+            None => {
+                self.unhandled(format!("DECRQSS {}", request.escape_ascii()));
+                self.reply(b"\x1bP0$r");
+            }
+        }
+        self.reply(reply::ST);
+    }
+
     // OSC.
 
-    fn osc(&mut self, params: &[&[u8]]) {
+    /// `bell`: the OSC ended with BEL, so replies do too.
+    fn osc(&mut self, params: &[&[u8]], bell: bool) {
         let num = std::str::from_utf8(params[0])
             .ok()
             .and_then(|s| s.parse::<u16>().ok());
@@ -695,8 +926,15 @@ impl Terminal {
                     let index = std::str::from_utf8(pair[0])
                         .ok()
                         .and_then(|s| s.parse::<u8>().ok());
-                    match (index, pair.get(1).and_then(|s| palette::parse_color(s))) {
-                        (Some(i), Some(rgb)) => self.palette.colors[usize::from(i)] = rgb,
+                    let spec = pair.get(1).copied().unwrap_or_default();
+                    match (index, spec) {
+                        (Some(i), b"?") => {
+                            let rgb = self.palette.colors[usize::from(i)];
+                            self.report_color(&format!("4;{i}"), rgb, bell);
+                        }
+                        (Some(i), spec) if let Some(rgb) = palette::parse_color(spec) => {
+                            self.palette.colors[usize::from(i)] = rgb;
+                        }
                         _ => self.unhandled(format!("OSC 4 {}", pair.join(&b';').escape_ascii())),
                     }
                 }
@@ -718,6 +956,11 @@ impl Terminal {
             // sets the next one.
             Some(n @ 10..=12) => {
                 for (which, spec) in (n..=12).zip(args) {
+                    if *spec == b"?" {
+                        let rgb = *self.dynamic_color(which);
+                        self.report_color(&which.to_string(), rgb, bell);
+                        continue;
+                    }
                     match palette::parse_color(spec) {
                         Some(rgb) => *self.dynamic_color(which) = rgb,
                         None => self.unhandled(format!("OSC {which} {}", spec.escape_ascii())),
@@ -899,6 +1142,19 @@ impl Perform for Terminal {
             (b"", b'u') if params.is_empty() => self.restore_cursor(),
             (b" ", b'q') => self.set_cursor_style(param(params, 0, 0)),
             (b"!", b'p') => self.soft_reset(),
+            // Device attributes: primary and secondary.
+            (b"", b'c') if param(params, 0, 0) == 0 => self.reply(reply::DA1),
+            (b">", b'c') if param(params, 0, 0) == 0 => self.reply(&reply::da2()),
+            (b"" | b"?", b'n') => self.device_status(params, !intermediates.is_empty()),
+            (b"$" | b"?$", b'p') => {
+                let private = intermediates[0] == b'?';
+                for g in params.iter() {
+                    self.report_mode(g[0], private);
+                }
+            }
+            (b">", b'q') if param(params, 0, 0) == 0 => self.reply(&reply::xtversion()),
+            (b"", b't') => self.window_op(params),
+            (&[marker @ (b'>' | b'<' | b'=' | b'?')], b'u') => self.keyboard_mode(params, marker),
             _ => self.unhandled(describe_csi(params, intermediates, action)),
         }
     }
@@ -939,12 +1195,52 @@ impl Perform for Terminal {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.osc(params);
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.osc(params, bell_terminated);
     }
 
-    fn hook(&mut self, params: &Params, intermediates: &[u8], _ignored: bool, action: u8) {
-        let csi = describe_csi(params, intermediates, action);
-        self.unhandled(format!("DCS{}", &csi[3..]));
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignored: bool, action: u8) {
+        let request = match (intermediates, action) {
+            _ if ignored || !params.is_empty() => None,
+            (b"$", b'q') => Some(DcsRequest::Setting),
+            (b"+", b'q') => Some(DcsRequest::Capabilities),
+            _ => None,
+        };
+        self.dcs = request.map(|request| Dcs {
+            request,
+            data: Vec::new(),
+            overflow: false,
+        });
+        if self.dcs.is_none() {
+            let csi = describe_csi(params, intermediates, action);
+            self.unhandled(format!("DCS{}", &csi[3..]));
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(dcs) = &mut self.dcs {
+            if dcs.data.len() < reply::MAX_DCS {
+                dcs.data.push(byte);
+            } else {
+                dcs.overflow = true;
+            }
+        }
+    }
+
+    // A string abandoned with CAN or SUB ends here too, and is answered
+    // as if it had ended normally (the parser doesn't say which it was).
+    fn unhook(&mut self) {
+        let Some(dcs) = self.dcs.take() else { return };
+        if dcs.overflow {
+            return self.unhandled(format!(
+                "DCS {:?} longer than {}",
+                dcs.request,
+                reply::MAX_DCS
+            ));
+        }
+        match dcs.request {
+            DcsRequest::Setting => self.report_setting(&dcs.data),
+            DcsRequest::Capabilities => self.reply(&reply::xtgettcap(&dcs.data)),
+        }
     }
 }
