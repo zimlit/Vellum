@@ -198,6 +198,13 @@ impl Session {
         Ok(())
     }
 
+    /// The VT in the foreground, from sysfs; `None` if it can't be told
+    /// (no VTs, or a seat without them).
+    pub fn foreground_vt() -> Option<i32> {
+        let active = std::fs::read_to_string("/sys/class/tty/tty0/active").ok()?;
+        parse_vt(&active)
+    }
+
     pub fn fd(&self) -> BorrowedFd<'_> {
         // SAFETY: the seat fd stays open as long as `self.seat` does.
         unsafe { BorrowedFd::borrow_raw(self.seat_fd) }
@@ -226,9 +233,22 @@ impl Drop for Session {
     }
 }
 
+/// `tty3\n` → 3.
+fn parse_vt(active: &str) -> Option<i32> {
+    active.trim().strip_prefix("tty")?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_vt_from_sysfs() {
+        assert_eq!(parse_vt("tty3\n"), Some(3));
+        assert_eq!(parse_vt("tty12"), Some(12));
+        assert_eq!(parse_vt("ttyS0\n"), None);
+        assert_eq!(parse_vt(""), None);
+    }
 
     #[test]
     fn disable_waits_for_one_acknowledgement() {

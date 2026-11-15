@@ -152,6 +152,41 @@ fn repeat_reads_the_current_modifiers() {
 }
 
 #[test]
+fn reset_lets_go_of_held_modifiers() {
+    let mut kb = us();
+    press(&mut kb, KEY_LEFTCTRL);
+    press(&mut kb, KEY_LEFTALT);
+    assert_eq!(press(&mut kb, KEY_F1).unwrap().mods, Mods::CTRL | Mods::ALT);
+    // Switched away: the releases happen on another VT.
+    kb.reset();
+    let a = press(&mut kb, KEY_A).unwrap();
+    assert_eq!((a.text.as_str(), a.mods), ("a", Mods::empty()));
+}
+
+#[test]
+fn reset_keeps_locks() {
+    let mut kb = us();
+    press(&mut kb, KEY_CAPSLOCK);
+    release(&mut kb, KEY_CAPSLOCK);
+    press(&mut kb, KEY_LEFTSHIFT);
+    kb.reset();
+    let a = press(&mut kb, KEY_A).unwrap();
+    assert_eq!((a.text.as_str(), a.mods), ("A", Mods::CAPS_LOCK));
+}
+
+#[test]
+fn reset_drops_a_compose_sequence() {
+    let compose = "<dead_acute> <e> : \"é\" eacute\n";
+    let mut kb = Keyboard::with_compose(&layout("us", "intl"), compose).unwrap();
+    assert_eq!(press(&mut kb, KEY_APOSTROPHE), None);
+    kb.reset();
+    // Its release isn't swallowed any more (it happened elsewhere), and
+    // e is plain e.
+    assert_eq!(press(&mut kb, KEY_E).unwrap().text, "e");
+    assert!(release(&mut kb, KEY_E).is_some());
+}
+
+#[test]
 fn which_keys_repeat() {
     let kb = us();
     assert!(kb.repeats(KEY_A));
@@ -179,11 +214,25 @@ fn repeat_state() {
 }
 
 #[test]
+fn repeat_state_clears() {
+    let mut r = RepeatState::default();
+    assert_eq!(r.clear(), Timer::Unchanged, "nothing repeating");
+    r.press(KEY_A, true);
+    assert_eq!(r.clear(), Timer::Stop);
+    assert_eq!(r.key(), None);
+    // a's release, if it ever comes, changes nothing.
+    assert_eq!(r.release(KEY_A), Timer::Unchanged);
+}
+
+#[test]
 fn repeat_timer_disarms() {
     let mut r = KeyRepeat::new().unwrap();
     r.press(KEY_A, true).unwrap();
     r.release(KEY_A).unwrap();
     assert_eq!(r.expired().unwrap(), None, "nothing expired, nothing held");
+    r.press(KEY_A, true).unwrap();
+    r.stop().unwrap();
+    assert_eq!(r.expired().unwrap(), None, "stopped");
 }
 
 #[test]

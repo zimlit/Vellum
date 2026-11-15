@@ -270,6 +270,22 @@ impl Keyboard {
         })
     }
 
+    /// Forget every held key, after the session was disabled: the keys
+    /// released on another VT never reach us, so xkb would keep Ctrl and
+    /// Alt held from the Ctrl+Alt+Fn that switched away. Locks (Caps Lock,
+    /// a locked layout) stay as they were. An unfinished compose sequence
+    /// is dropped.
+    pub fn reset(&mut self) {
+        let locked = self.state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let layout = self.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED);
+        self.state = xkb::State::new(&self.keymap);
+        self.state.update_mask(0, 0, locked, 0, 0, layout);
+        if let Some(c) = &mut self.compose {
+            c.reset();
+        }
+        self.swallowed.clear();
+    }
+
     fn mods(&self) -> Mods {
         let m = &self.mods;
         let active = |idx| {
@@ -328,6 +344,14 @@ impl RepeatState {
         }
     }
 
+    /// Stop repeating whatever was, as if every key were released.
+    pub fn clear(&mut self) -> Timer {
+        match self.key.take() {
+            Some(_) => Timer::Stop,
+            None => Timer::Unchanged,
+        }
+    }
+
     /// The key that's repeating.
     pub fn key(&self) -> Option<u32> {
         self.key
@@ -359,6 +383,12 @@ impl KeyRepeat {
 
     pub fn release(&mut self, key: u32) -> io::Result<()> {
         let t = self.state.release(key);
+        self.apply(t)
+    }
+
+    /// Stop repeating (the session was disabled; releases won't come).
+    pub fn stop(&mut self) -> io::Result<()> {
+        let t = self.state.clear();
         self.apply(t)
     }
 
@@ -476,6 +506,22 @@ impl Devices {
         }
         Ok(())
     }
+
+    /// Close every device through the seat, before acknowledging that the
+    /// session is disabled. libinput reports them removed (logged by the
+    /// next [`Devices::dispatch`]). Must not be called with the session
+    /// borrowed.
+    pub fn suspend(&mut self) {
+        self.libinput.suspend();
+    }
+
+    /// Reopen the devices once the session is enabled again; they're
+    /// reported added. Must not be called with the session borrowed.
+    pub fn resume(&mut self) -> Result<()> {
+        self.libinput
+            .resume()
+            .map_err(|()| anyhow!("libinput couldn't resume (reopening the input devices)"))
+    }
 }
 
 impl AsFd for Devices {
@@ -506,7 +552,7 @@ fn log_device(what: &str, event: &impl EventTrait) {
 pub enum Binding {
     /// Ctrl+Alt+Backspace: leave, closing the shell.
     Exit,
-    /// Ctrl+Alt+F1..F12: switch to that VT (step 7).
+    /// Ctrl+Alt+F1..F12: switch to that VT.
     SwitchVt(u8),
     /// Shift+PgUp/PgDn/Home/End: move the view through the scrollback.
     /// Only on the primary screen; on the alternate screen the program gets

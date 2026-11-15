@@ -97,10 +97,11 @@ Notes:
 
 ## Input and terminal behavior
 
-- **Vellum's own keys:** Ctrl+Alt+Backspace exits cleanly (closing the shell). Shift+PgUp/PgDn (half a screen) and Shift+Home/End scroll the view on the primary screen; on the alternate screen the program gets them. Ctrl+Alt+F1–F12 are swallowed until VT switching (step 7).
+- **Vellum's own keys:** Ctrl+Alt+Backspace exits cleanly (closing the shell). Shift+PgUp/PgDn (half a screen) and Shift+Home/End scroll the view on the primary screen; on the alternate screen the program gets them. Ctrl+Alt+F1–F12 switch VTs through the seat (the seat sets the console keyboard to `K_OFF`, so the kernel never sees them); repeats and releases are swallowed, and the VT already in front is left alone.
+- **Across VT switches:** on disable, the display pauses, libinput is suspended (closing devices through the seat), the xkb state is reset (locks kept) and key repeat stops, *then* the disable is acknowledged. Releases made on the other VT never arrive, so without the reset Ctrl and Alt would stay held. On enable: full modeset, libinput resumed, full redraw. The PTY is read throughout.
 - **Scrollback view:** stays on the same lines as output arrives; any key sent to the shell snaps back to live, except releases and modifier keys (else letting go of Shift under the kitty protocol would). Replies don't snap back. Reset by the alternate screen, ED 3 and RIS. The cursor is hidden while scrolled back.
 - **Key repeat** is ours (timerfd, 600 ms then 25/s); holding a repeating key and pressing Shift keeps repeating, shifted.
-- **Replies** to queries go through the same PTY write queue as keys, so order is kept: DA1/DA2, DSR/CPR, DECRQM, XTVERSION, OSC 4/10/11/12 color queries, kitty flags query, XTGETTCAP, DECRQSS, window size reports (CSI 14/16/18 t), focus events (1004; sent once VT switching gives focus changes).
+- **Replies** to queries go through the same PTY write queue as keys, so order is kept: DA1/DA2, DSR/CPR, DECRQM, XTVERSION, OSC 4/10/11/12 color queries, kitty flags query, XTGETTCAP, DECRQSS, window size reports (CSI 14/16/18 t), focus events (1004: out when switched away, in when back).
 - **Edge cell backgrounds** extend over the margin around the centred grid, so a program's background reaches the screen edge.
 - **Known, not ours:** Emacs never writes the bottom-right cell when the terminal has `am` (its `tty_write_glyphs` rule), so that cell keeps vellum's default background. Workaround on the Emacs side: set the terminal background with OSC 11 to match the theme.
 
@@ -131,7 +132,7 @@ Notes:
 4. **Text v0:** fontconfig + skrifa outlines + the **GPU compute rasterizer** (see "Glyph rasterizer"; no temporary CPU rasterizer) into the atlas; instanced cell renderer; raw shell output. Validate the rasterizer against a CPU reference of the same algorithm in tests, and later by diffing against FreeType/swash output for the same font, size and hinting.
 5. **Terminal core:** VT parser, grid, scrollback, alternate screen, SGR attributes.
 6. **Input:** libinput + xkbcommon, key → escape-sequence encoding.
-7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Until then vellum exits cleanly when its session is disabled.
+7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Tested from SSH with `sudo scripts/vt-cycle.sh`.
 8. **Configuration and extensibility:** user settings (fonts, colors, keymap, key bindings, scrollback, ...) and a way to extend vellum. Technology and design are decided when this step is planned.
 9. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
 10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).

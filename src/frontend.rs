@@ -201,6 +201,13 @@ pub fn run(args: Args) -> Result<()> {
                                 // and its output keeps being read.
                                 display.pause();
                                 flip_pending = false;
+                                devices.suspend();
+                                // Keys let go of on the other VT never
+                                // come back up here.
+                                keyboard.reset();
+                                repeat.stop().context("stopping key repeat")?;
+                                term.focus(false);
+                                send_replies(&mut term, &mut to_shell, &shell.master)?;
                                 session.borrow_mut().ack_disable()?;
                                 tracing::info!("session disabled (switched to another VT)");
                             }
@@ -212,6 +219,9 @@ pub fn run(args: Args) -> Result<()> {
                                     .context("taking the display back")?;
                                 flip_pending = false;
                                 dirty = true;
+                                devices.resume()?;
+                                term.focus(true);
+                                send_replies(&mut term, &mut to_shell, &shell.master)?;
                                 tracing::info!("session enabled (back on our VT)");
                             }
                         }
@@ -231,13 +241,7 @@ pub fn run(args: Args) -> Result<()> {
                     Some(0) => {}
                     Some(n) => {
                         term.feed(&pty_buf[..n]);
-                        let replies = term.take_replies();
-                        if !replies.is_empty() {
-                            tracing::trace!(target: "vellum::pty", "reply: {}", replies.escape_ascii());
-                            to_shell
-                                .send(&shell.master, &replies)
-                                .context("writing to the PTY")?;
-                        }
+                        send_replies(&mut term, &mut to_shell, &shell.master)?;
                         dirty = true;
                         if !term.synchronized() {
                             sync_since = None;
@@ -272,6 +276,7 @@ pub fn run(args: Args) -> Result<()> {
                             match on_key(&event, &mut term, &mut to_shell, &shell.master)? {
                                 After::Exit => break 'events,
                                 After::Redraw => dirty = true,
+                                After::SwitchVt(vt) => switch_vt(&session, vt),
                                 After::Nothing => {}
                             }
                         }
@@ -284,6 +289,7 @@ pub fn run(args: Args) -> Result<()> {
                         match on_key(&event, &mut term, &mut to_shell, &shell.master)? {
                             After::Exit => break 'events,
                             After::Redraw => dirty = true,
+                            After::SwitchVt(vt) => switch_vt(&session, vt),
                             After::Nothing => {}
                         }
                     }
@@ -338,7 +344,36 @@ enum After {
     Nothing,
     /// The screen changed (the view moved).
     Redraw,
+    /// Ctrl+Alt+Fn: ask the seat for that VT.
+    SwitchVt(u8),
     Exit,
+}
+
+/// Ask the seat to switch to `vt`. The switch itself arrives later as a
+/// [`SessionEvent::Disabled`]; a failed request is only logged, since
+/// vellum carries on where it is.
+fn switch_vt(session: &RefCell<Session>, vt: u8) {
+    if Session::foreground_vt() == Some(vt.into()) {
+        tracing::debug!(vt, "already on VT {vt}; not switching");
+        return;
+    }
+    tracing::info!(vt, "switching to VT {vt}");
+    if let Err(e) = session.borrow_mut().switch_session(vt.into()) {
+        tracing::warn!("{e:#}");
+    }
+}
+
+/// Queue the terminal's replies (to queries, and focus reports) for the
+/// shell, after anything already queued.
+fn send_replies(term: &mut Terminal, to_shell: &mut pty::Writer, master: &OwnedFd) -> Result<()> {
+    let replies = term.take_replies();
+    if !replies.is_empty() {
+        tracing::trace!(target: "vellum::pty", "reply: {}", replies.escape_ascii());
+        to_shell
+            .send(master, &replies)
+            .context("writing to the PTY")?;
+    }
+    Ok(())
 }
 
 /// Handle one key: vellum's own bindings, else encode it and queue it for
@@ -355,9 +390,9 @@ fn on_key(
             tracing::info!("exiting on Ctrl+Alt+Backspace");
             return Ok(After::Exit);
         }
+        // Repeats and the release are swallowed below.
         Some(Binding::SwitchVt(n)) if event.kind == KeyKind::Press => {
-            tracing::info!(vt = n, "Ctrl+Alt+F{n}: VT switching is step 7; ignored");
-            return Ok(After::Nothing);
+            return Ok(After::SwitchVt(n));
         }
         // The alternate screen has no scrollback: the program gets these.
         Some(Binding::Scroll(scroll)) if !term.alternate_screen() => {
