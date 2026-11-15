@@ -23,6 +23,26 @@ pub struct CellMetrics {
     pub height: u32,
     /// Distance from the cell's top edge down to the baseline.
     pub baseline: u32,
+    pub underline: Stroke,
+    pub strikeout: Stroke,
+}
+
+/// A horizontal line across the cell (underline, strikeout), in whole
+/// pixels from its top edge. Always inside the cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stroke {
+    pub top: u32,
+    pub thickness: u32,
+}
+
+impl Stroke {
+    /// A stroke whose top is `top` pixels below the cell's top edge (may be
+    /// fractional or out of range), rounded and kept inside the cell.
+    fn fit(top: f32, thickness: f32, cell_height: u32) -> Self {
+        let thickness = (thickness.round().max(1.0) as u32).min(cell_height);
+        let top = (top.round().max(0.0) as u32).min(cell_height - thickness);
+        Self { top, thickness }
+    }
 }
 
 /// A rendered glyph: its outline as lines plus where to place it.
@@ -66,6 +86,14 @@ impl Font {
                 width: 0,
                 height: 0,
                 baseline: 0,
+                underline: Stroke {
+                    top: 0,
+                    thickness: 0,
+                },
+                strikeout: Stroke {
+                    top: 0,
+                    thickness: 0,
+                },
             },
         };
         let font_ref = font.font_ref()?;
@@ -149,10 +177,44 @@ impl Font {
         let height = (m.ascent + descent + m.leading)
             .ceil()
             .max(baseline + descent.ceil());
+        let cell_height = height.max(1.0) as u32;
+
+        // Font decoration offsets are y-up from the baseline. Fallbacks
+        // when the font has none: a 1/14 em line halfway down the descent,
+        // and a strikeout centred on half the x-height.
+        let fallback = self.size / 14.0;
+        let underline = m.underline.map_or((-descent / 2.0, fallback), |d| {
+            // The post table's position is nominally the top of the line,
+            // but fonts set it as the centre (as FreeType notes and most
+            // terminals assume).
+            (d.offset, d.thickness)
+        });
+        let (u_center, u_thickness) = underline;
+        let underline = Stroke::fit(
+            baseline - u_center - u_thickness / 2.0,
+            u_thickness,
+            cell_height,
+        );
+        let strikeout = match m.strikeout {
+            // OS/2: the top of the stroke.
+            Some(d) if d.thickness > 0.0 => {
+                Stroke::fit(baseline - d.offset, d.thickness, cell_height)
+            }
+            _ => {
+                let x_height = m.x_height.unwrap_or(m.ascent / 2.0);
+                Stroke::fit(
+                    baseline - x_height / 2.0 - u_thickness / 2.0,
+                    u_thickness,
+                    cell_height,
+                )
+            }
+        };
         Ok(CellMetrics {
             width: advance.round().max(1.0) as u32,
-            height: height.max(1.0) as u32,
+            height: cell_height,
             baseline: baseline.max(0.0) as u32,
+            underline,
+            strikeout,
         })
     }
 }
@@ -232,6 +294,56 @@ mod tests {
         }
         assert!(large.width >= 2 * small.width - 1, "{small:?} {large:?}");
         assert!(large.height >= 2 * small.height - 2, "{small:?} {large:?}");
+    }
+
+    #[test]
+    fn decorations_sit_where_expected() {
+        for size in [8, 16, 32] {
+            let c = monospace(&format!("monospace:pixelsize={size}")).cell();
+            let (u, s) = (c.underline, c.strikeout);
+            for stroke in [u, s] {
+                assert!(stroke.thickness >= 1, "{c:?}");
+                assert!(stroke.top + stroke.thickness <= c.height, "{c:?}");
+            }
+            assert!(
+                u.top + 1 >= c.baseline,
+                "underline at or below the baseline: {c:?}"
+            );
+            assert!(s.top < c.baseline, "strikeout above the baseline: {c:?}");
+            assert!(s.top > c.height / 6, "strikeout below the top: {c:?}");
+        }
+    }
+
+    #[test]
+    fn strokes_are_kept_inside_the_cell() {
+        assert_eq!(
+            Stroke::fit(-3.0, 2.0, 10),
+            Stroke {
+                top: 0,
+                thickness: 2
+            }
+        );
+        assert_eq!(
+            Stroke::fit(9.6, 2.4, 10),
+            Stroke {
+                top: 8,
+                thickness: 2
+            }
+        );
+        assert_eq!(
+            Stroke::fit(4.0, 0.2, 10),
+            Stroke {
+                top: 4,
+                thickness: 1
+            }
+        );
+        assert_eq!(
+            Stroke::fit(0.0, 30.0, 10),
+            Stroke {
+                top: 0,
+                thickness: 10
+            }
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ use crate::scanout::{
 use crate::session::Session;
 use crate::signals::{self, SignalFd};
 use crate::term::Terminal;
-use crate::text::{self, Colors, TextRenderer};
+use crate::text::{self, TextRenderer};
 use crate::{gbm, pty, server, vk};
 
 const BUFFER_COUNT: usize = 2;
@@ -95,12 +95,11 @@ pub fn run(args: Args) -> Result<()> {
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, BUFFER_COUNT)?;
     let mut term = Terminal::new(cols, rows);
-    let colors = Colors::default();
 
     // First frame: render, wait on the CPU, and modeset with it.
     let start = Instant::now();
     render(&mut buffers[0], |rec, image| {
-        text.draw(rec, image, 0, &term, &colors)
+        text.draw(rec, image, 0, &term)
     })?;
     buffers[0].cmd.wait()?;
 
@@ -209,7 +208,7 @@ pub fn run(args: Args) -> Result<()> {
         if dirty && !flip_pending && !held {
             let slot = next;
             queue_frame(&mut display, &mut buffers[slot], |rec, image| {
-                text.draw(rec, image, slot, &term, &colors)
+                text.draw(rec, image, slot, &term)
             })?;
             flip_pending = true;
             dirty = false;
@@ -290,9 +289,7 @@ fn probe(card: &Card, args: &Args) -> Result<()> {
           \x1b(0lqqqk\r\nx   x\r\nmqqqj\x1b(B",
     );
     let start = Instant::now();
-    render(&mut buf, |rec, image| {
-        text.draw(rec, image, 0, &term, &Colors::default())
-    })?;
+    render(&mut buf, |rec, image| text.draw(rec, image, 0, &term))?;
     buf.cmd.wait()?;
     tracing::info!(
         render_time = ?start.elapsed(),
