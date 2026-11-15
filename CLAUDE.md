@@ -36,7 +36,8 @@ Language: **Rust** (all crate choices below assume it).
 | Shaders | **GLSL → SPIR-V with `glslc`** in `build.rs` | Needs shaderc (`glslc`) at build time. |
 | Display | **Own KMS, atomic modesetting** (libdrm / `drm` crate) | Do NOT use `VK_KHR_display` / `VK_EXT_acquire_drm_display`: it gives KMS control to the driver, VT switching is poorly tested, and driver support varies. |
 | Render targets | GBM-allocated (or Vulkan `VK_EXT_image_drm_format_modifier`) **dma-bufs**, imported into Vulkan with `VK_EXT_external_memory_dma_buf`, registered with `drmModeAddFB2WithModifiers` | The same import path is reused later for Wayland client buffers. |
-| Input | `libinput` (`input` crate) + `xkbcommon` | evdev gives physical keycodes; xkbcommon turns them into keysyms and UTF-8. |
+| Input | `libinput` (`input` crate) + `xkbcommon` | evdev gives physical keycodes; xkbcommon turns them into keysyms and UTF-8. libinput opens devices through the libseat session (`src/input.rs`). Keymap from `--xkb-*` flags, else `XKB_DEFAULT_*`; compose from the locale. |
+| Key encoding | **Legacy xterm + kitty keyboard protocol** (`src/keys.rs`) | Pure function from key event + modes to bytes. Kitty flags have a push/pop stack per screen. Text comes from the keysym, not xkb's Ctrl transform; Ctrl combinations use xterm's table, falling back to the US layout's key. |
 | Session / VT | **libseat** (logind or seatd) | Lets it run without root; handles DRM master, device open/revoke and VT switching. |
 | Font discovery | **system fontconfig**, own FFI bindings | Also read per-font settings: `hintstyle`, `antialias`, `rgba`, `lcdfilter`. Hand-written bindings like `gbm.rs`. |
 | Shaping | **HarfRust** | HarfBuzz's official Rust port, built on `read-fonts`. Preferred over swash's shaper, which covers less. |
@@ -93,6 +94,15 @@ Notes:
 - Use plane-aware atomic commits from the start (primary plane for the terminal; later a cursor/overlay plane, and direct scanout of fullscreen Wayland client buffers).
 - Pass KMS fences via sync files, Vulkan side via external semaphores.
 - Resize/mode change → update the PTY window size (`TIOCSWINSZ`) so the kernel sends SIGWINCH to the child.
+
+## Input and terminal behavior
+
+- **Vellum's own keys:** Ctrl+Alt+Backspace exits cleanly (closing the shell). Shift+PgUp/PgDn (half a screen) and Shift+Home/End scroll the view on the primary screen; on the alternate screen the program gets them. Ctrl+Alt+F1–F12 are swallowed until VT switching (step 7).
+- **Scrollback view:** stays on the same lines as output arrives; any key sent to the shell snaps back to live, except releases and modifier keys (else letting go of Shift under the kitty protocol would). Replies don't snap back. Reset by the alternate screen, ED 3 and RIS. The cursor is hidden while scrolled back.
+- **Key repeat** is ours (timerfd, 600 ms then 25/s); holding a repeating key and pressing Shift keeps repeating, shifted.
+- **Replies** to queries go through the same PTY write queue as keys, so order is kept: DA1/DA2, DSR/CPR, DECRQM, XTVERSION, OSC 4/10/11/12 color queries, kitty flags query, XTGETTCAP, DECRQSS, window size reports (CSI 14/16/18 t), focus events (1004; sent once VT switching gives focus changes).
+- **Edge cell backgrounds** extend over the margin around the centred grid, so a program's background reaches the screen edge.
+- **Known, not ours:** Emacs never writes the bottom-right cell when the terminal has `am` (its `tty_write_glyphs` rule), so that cell keeps vellum's default background. Workaround on the Emacs side: set the terminal background with OSC 11 to match the theme.
 
 ## Vulkan conventions
 
