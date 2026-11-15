@@ -48,6 +48,8 @@ mod ffi {
         pub fn FcNameParse(name: *const FcChar8) -> *mut FcPattern;
         pub fn FcPatternDestroy(p: *mut FcPattern);
         pub fn FcPatternAddDouble(p: *mut FcPattern, object: *const c_char, d: c_double) -> FcBool;
+        pub fn FcPatternAddInteger(p: *mut FcPattern, object: *const c_char, i: c_int) -> FcBool;
+        pub fn FcPatternDel(p: *mut FcPattern, object: *const c_char) -> FcBool;
         pub fn FcPatternGetString(
             p: *const FcPattern,
             object: *const c_char,
@@ -170,6 +172,12 @@ impl LcdFilter {
     }
 }
 
+/// `FC_WEIGHT_REGULAR`, `FC_WEIGHT_BOLD`, `FC_SLANT_ROMAN`, `FC_SLANT_ITALIC`.
+pub const WEIGHT_REGULAR: c_int = 80;
+pub const WEIGHT_BOLD: c_int = 200;
+pub const SLANT_ROMAN: c_int = 0;
+pub const SLANT_ITALIC: c_int = 100;
+
 /// A font file chosen by fontconfig.
 #[derive(Clone, Debug)]
 pub struct FontMatch {
@@ -180,6 +188,10 @@ pub struct FontMatch {
     pub style: String,
     /// Size in pixels, from the pattern's size and DPI.
     pub pixel_size: f64,
+    /// Fontconfig's weight scale: 80 regular, 200 bold.
+    pub weight: c_int,
+    /// 0 roman, 100 italic, 110 oblique.
+    pub slant: c_int,
     pub rendering: Rendering,
 }
 
@@ -199,6 +211,45 @@ impl Config {
     /// `monospace:size=11` or `Iosevka:style=Bold:pixelsize=24`), with point
     /// sizes converted to pixels at `dpi` unless the pattern sets its own.
     pub fn match_font(&self, pattern: &str, dpi: f64) -> Result<FontMatch> {
+        self.match_with(pattern, dpi, |_| {})
+    }
+
+    /// Like [`Config::match_font`], asking for a bold and/or italic face.
+    /// These replace any weight, slant or style the pattern names. What
+    /// comes back may still not be bold or italic, if the family has no
+    /// such face: check [`FontMatch::weight`] and [`FontMatch::slant`].
+    pub fn match_face(
+        &self,
+        pattern: &str,
+        dpi: f64,
+        bold: bool,
+        italic: bool,
+    ) -> Result<FontMatch> {
+        self.match_with(pattern, dpi, |pat| {
+            let p = pat.0.as_ptr();
+            // SAFETY: p is a live pattern; the object names are static.
+            unsafe {
+                if bold || italic {
+                    ffi::FcPatternDel(p, c"style".as_ptr());
+                }
+                if bold {
+                    ffi::FcPatternDel(p, c"weight".as_ptr());
+                    ffi::FcPatternAddInteger(p, c"weight".as_ptr(), WEIGHT_BOLD);
+                }
+                if italic {
+                    ffi::FcPatternDel(p, c"slant".as_ptr());
+                    ffi::FcPatternAddInteger(p, c"slant".as_ptr(), SLANT_ITALIC);
+                }
+            }
+        })
+    }
+
+    fn match_with(
+        &self,
+        pattern: &str,
+        dpi: f64,
+        edit: impl FnOnce(&Pattern),
+    ) -> Result<FontMatch> {
         let name = CString::new(pattern).context("font pattern contains a NUL byte")?;
         // SAFETY: name is NUL-terminated; result is a new pattern or null.
         let pat = Pattern::new(unsafe { ffi::FcNameParse(name.as_ptr().cast()) })
@@ -207,6 +258,7 @@ impl Config {
             // SAFETY: pat is a live pattern; the object name is static.
             unsafe { ffi::FcPatternAddDouble(pat.0.as_ptr(), c"dpi".as_ptr(), dpi) };
         }
+        edit(&pat);
         // SAFETY: live config and pattern. Substitution applies fonts.conf
         // edits, then fills defaults (including pixelsize = size * dpi / 72).
         let matched = unsafe {
@@ -306,6 +358,8 @@ impl Pattern {
             pixel_size: self
                 .double(c"pixelsize")
                 .ok_or_else(|| anyhow!("matched font has no pixel size"))?,
+            weight: self.int(c"weight").unwrap_or(WEIGHT_REGULAR),
+            slant: self.int(c"slant").unwrap_or(SLANT_ROMAN),
             rendering,
         })
     }
@@ -352,6 +406,23 @@ mod tests {
         assert!((at("monospace:pixelsize=17", 144.0) - 17.0).abs() < 1e-6);
         // A dpi in the pattern wins over the argument.
         assert!((at("monospace:size=12:dpi=96", 300.0) - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn faces_are_asked_for_by_weight_and_slant() {
+        let config = Config::new().unwrap();
+        let regular = config.match_face("monospace", 96.0, false, false).unwrap();
+        let bold = config.match_face("monospace", 96.0, true, false).unwrap();
+        let italic = config.match_face("monospace", 96.0, false, true).unwrap();
+        // The system may lack the faces, but never gets lighter or upright
+        // for asking.
+        assert!(bold.weight >= regular.weight, "{bold:?}");
+        assert!(italic.slant >= regular.slant, "{italic:?}");
+        // A style in the pattern doesn't win over the request.
+        let m = config
+            .match_face("monospace:style=Regular", 96.0, true, false)
+            .unwrap();
+        assert_eq!(m.weight, bold.weight);
     }
 
     #[test]

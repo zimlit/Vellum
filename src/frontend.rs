@@ -23,7 +23,7 @@ use rustix::io::Errno;
 
 use crate::cli::Args;
 use crate::event::Poller;
-use crate::font::{Font, fontconfig};
+use crate::font::{Face, FontSet, fontconfig};
 use crate::kms::{self, Card};
 use crate::scanout::{
     self, create_buffer, negotiate_modifiers, prepare, queue_frame, render, vulkan_device,
@@ -245,23 +245,37 @@ fn read_pty(master: &OwnedFd, buf: &mut [u8]) -> Result<Option<usize>> {
     }
 }
 
-/// Find and load the font for `pattern` at the monitor's DPI.
-fn load_font(pattern: &str, dpi: f64) -> Result<Font> {
-    let m = fontconfig::Config::new()?.match_font(pattern, dpi)?;
-    let font = Font::load(&m)?;
-    let cell = font.cell();
+/// Find and load the fonts for `pattern` at the monitor's DPI.
+fn load_font(pattern: &str, dpi: f64) -> Result<FontSet> {
+    let fonts = FontSet::load(&fontconfig::Config::new()?, pattern, dpi)?;
+    let regular = fonts.regular();
+    let cell = fonts.cell();
     tracing::info!(
         pattern,
-        family = %m.family,
-        style = %m.style,
-        file = %m.path.display(),
-        pixel_size = %format_args!("{:.1}", m.pixel_size),
+        pixel_size = %format_args!("{:.1}", regular.size()),
         dpi = %format_args!("{dpi:.0}"),
         cell = %format_args!("{}x{}", cell.width, cell.height),
-        rendering = ?m.rendering,
-        "loaded font"
+        rendering = ?regular.rendering(),
+        "loaded fonts"
     );
-    Ok(font)
+    for face in Face::ALL {
+        let font = fonts.face(face);
+        let s = font.synthetic();
+        let synthetic = match (s.embolden > 0.0, s.skew != 0.0) {
+            (false, false) => "no",
+            (true, false) => "bold",
+            (false, true) => "italic",
+            (true, true) => "bold italic",
+        };
+        tracing::info!(
+            face = face.name(),
+            font = font.name(),
+            file = %font.file().display(),
+            synthetic,
+            "font face"
+        );
+    }
+    Ok(fonts)
 }
 
 /// Everything short of the modeset, without a seat. Useful from SSH or from

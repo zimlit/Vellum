@@ -1,17 +1,22 @@
 //! Fonts: finding them (fontconfig), reading them (skrifa), and turning
 //! glyphs into line segments for the GPU rasterizer.
+//!
+//! A [`FontSet`] holds the four faces the terminal draws with (regular,
+//! bold, italic, bold italic). Faces the family lacks are synthesized from
+//! another face (see [`Synthetic`]).
 
 pub mod flatten;
 pub mod fontconfig;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, SmoothMode, Target};
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 
-pub use flatten::{Line, Outline};
+pub use flatten::{Line, Outline, Synthetic};
 pub use fontconfig::{FontMatch, HintStyle, Rendering};
 
 use flatten::{Flattener, TOLERANCE};
@@ -55,33 +60,56 @@ pub struct Glyph {
 
 /// One face of a font file at one pixel size, with hinting set up.
 pub struct Font {
-    data: Vec<u8>,
+    /// Shared with synthetic faces made from this one.
+    data: Arc<[u8]>,
     index: u32,
     size: f32,
     rendering: Rendering,
     /// `None` when hinting is off.
     hinting: Option<HintingInstance>,
+    /// Applied to every glyph; nonzero for a synthesized face.
+    synthetic: Synthetic,
+    /// Family and style, for logs.
+    name: String,
+    /// Where it was loaded from (empty for fonts made from data).
+    file: PathBuf,
     metrics: CellMetrics,
 }
 
 impl Font {
     /// Load the font fontconfig picked, at its pixel size and settings.
     pub fn load(m: &FontMatch) -> Result<Self> {
-        let data = read(&m.path)?;
-        Self::from_data(data, m.index, m.pixel_size as f32, m.rendering)
-            .with_context(|| format!("loading {}", m.path.display()))
+        Self::load_at(m, m.pixel_size as f32)
     }
 
-    pub fn from_data(data: Vec<u8>, index: u32, size: f32, rendering: Rendering) -> Result<Self> {
+    /// Load the font fontconfig picked at `size` pixels.
+    pub fn load_at(m: &FontMatch, size: f32) -> Result<Self> {
+        let data = read(&m.path)?;
+        let mut font = Self::from_data(data, m.index, size, m.rendering)
+            .with_context(|| format!("loading {}", m.path.display()))?;
+        font.name = format!("{} {}", m.family, m.style);
+        font.file.clone_from(&m.path);
+        Ok(font)
+    }
+
+    pub fn from_data(
+        data: impl Into<Arc<[u8]>>,
+        index: u32,
+        size: f32,
+        rendering: Rendering,
+    ) -> Result<Self> {
         if !(size > 0.0 && size.is_finite()) {
             return Err(anyhow!("invalid font size {size}"));
         }
         let mut font = Self {
-            data,
+            data: data.into(),
             index,
             size,
             rendering,
             hinting: None,
+            synthetic: Synthetic::default(),
+            name: String::new(),
+            file: PathBuf::new(),
             metrics: CellMetrics {
                 width: 0,
                 height: 0,
@@ -128,6 +156,30 @@ impl Font {
         self.metrics
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    pub fn synthetic(&self) -> Synthetic {
+        self.synthetic
+    }
+
+    /// This face with `synthetic` added on top of what it has.
+    pub fn synthesize(&self, synthetic: Synthetic) -> Result<Self> {
+        let mut font = Self::from_data(self.data.clone(), self.index, self.size, self.rendering)?;
+        font.synthetic = Synthetic {
+            embolden: self.synthetic.embolden + synthetic.embolden,
+            skew: self.synthetic.skew + synthetic.skew,
+        };
+        font.name.clone_from(&self.name);
+        font.file.clone_from(&self.file);
+        Ok(font)
+    }
+
     /// The glyph for `ch`, or `None` if the font doesn't have one.
     pub fn glyph_id(&self, ch: char) -> Option<GlyphId> {
         self.font_ref().ok()?.charmap().map(ch)
@@ -144,7 +196,7 @@ impl Font {
             Some(instance) => DrawSettings::hinted(instance, false),
             None => DrawSettings::unhinted(Size::new(self.size), LocationRef::default()),
         };
-        let mut pen = Flattener::new(TOLERANCE);
+        let mut pen = Flattener::with_synthetic(TOLERANCE, self.synthetic);
         let adjusted = outline
             .draw(settings, &mut pen)
             .map_err(|e| anyhow!("drawing glyph {}: {e}", glyph.to_u32()))?;
@@ -217,6 +269,142 @@ impl Font {
             strikeout,
         })
     }
+}
+
+/// Which of the four faces text is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Face {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl Face {
+    pub const ALL: [Self; 4] = [Self::Regular, Self::Bold, Self::Italic, Self::BoldItalic];
+
+    pub fn new(bold: bool, italic: bool) -> Self {
+        match (bold, italic) {
+            (false, false) => Self::Regular,
+            (true, false) => Self::Bold,
+            (false, true) => Self::Italic,
+            (true, true) => Self::BoldItalic,
+        }
+    }
+
+    pub fn is_bold(self) -> bool {
+        matches!(self, Self::Bold | Self::BoldItalic)
+    }
+
+    pub fn is_italic(self) -> bool {
+        matches!(self, Self::Italic | Self::BoldItalic)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Bold => "bold",
+            Self::Italic => "italic",
+            Self::BoldItalic => "bold italic",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The four faces, all at the regular face's size. The cell size comes
+/// from the regular face only.
+pub struct FontSet {
+    faces: [Font; 4],
+}
+
+impl FontSet {
+    /// The faces for `pattern` at `dpi`. The regular face is what the
+    /// pattern matches; the others are asked for by weight and slant, and
+    /// synthesized when the family doesn't have them.
+    pub fn load(config: &fontconfig::Config, pattern: &str, dpi: f64) -> Result<Self> {
+        let regular_match = config.match_font(pattern, dpi)?;
+        let regular = Font::load(&regular_match)?;
+        let mut real: [Option<Font>; 4] = [None, None, None, None];
+        for face in [Face::Bold, Face::Italic, Face::BoldItalic] {
+            let m = config.match_face(pattern, dpi, face.is_bold(), face.is_italic())?;
+            if is_real_face(&regular_match, &m, face) {
+                real[face.index()] = Some(Font::load_at(&m, regular.size())?);
+            }
+        }
+        real[0] = Some(regular);
+        Self::complete(real)
+    }
+
+    /// Only a regular face; the others synthesized from it.
+    pub fn from_regular(regular: Font) -> Result<Self> {
+        Self::complete([Some(regular), None, None, None])
+    }
+
+    /// Fill in missing faces from the closest real one: bold italic from
+    /// italic (embolden) or bold (slant) before falling back to regular.
+    fn complete(mut faces: [Option<Font>; 4]) -> Result<Self> {
+        let size = faces[0].as_ref().expect("regular face").size();
+        let bold = Synthetic {
+            embolden: Synthetic::embolden_for(size),
+            skew: 0.0,
+        };
+        let italic = Synthetic {
+            embolden: 0.0,
+            skew: Synthetic::ITALIC_SKEW,
+        };
+        let both = Synthetic {
+            embolden: bold.embolden,
+            skew: italic.skew,
+        };
+        let get = |faces: &[Option<Font>; 4], f: Face| faces[f.index()].is_some();
+        if !get(&faces, Face::BoldItalic) {
+            let (base, add) = if get(&faces, Face::Italic) {
+                (Face::Italic, bold)
+            } else if get(&faces, Face::Bold) {
+                (Face::Bold, italic)
+            } else {
+                (Face::Regular, both)
+            };
+            let font = faces[base.index()].as_ref().unwrap().synthesize(add)?;
+            faces[Face::BoldItalic.index()] = Some(font);
+        }
+        for (face, add) in [(Face::Bold, bold), (Face::Italic, italic)] {
+            if !get(&faces, face) {
+                let font = faces[0].as_ref().unwrap().synthesize(add)?;
+                faces[face.index()] = Some(font);
+            }
+        }
+        Ok(Self {
+            faces: faces.map(|f| f.expect("every face filled in")),
+        })
+    }
+
+    pub fn face(&self, face: Face) -> &Font {
+        &self.faces[face.index()]
+    }
+
+    pub fn regular(&self) -> &Font {
+        self.face(Face::Regular)
+    }
+
+    pub fn cell(&self) -> CellMetrics {
+        self.regular().cell()
+    }
+}
+
+/// Whether fontconfig's answer `m` for `face` really is that face of the
+/// regular face's family: a different face of the same family, heavier
+/// exactly when bold was asked for and slanted exactly when italic was.
+/// (Variable fonts give the same file for every face; their named
+/// instances aren't applied yet, so those count as missing.)
+fn is_real_face(regular: &FontMatch, m: &FontMatch, face: Face) -> bool {
+    m.family == regular.family
+        && (m.path != regular.path || m.index != regular.index)
+        && face.is_bold() == (m.weight > regular.weight)
+        && face.is_italic() == (m.slant > regular.slant)
 }
 
 /// skrifa hinting for fontconfig's settings, or `None` for unhinted.
@@ -412,5 +600,102 @@ mod tests {
             .path;
         assert!(Font::from_data(read(&path).unwrap(), 0, 0.0, r).is_err());
         assert!(Font::from_data(read(&path).unwrap(), 0, f32::NAN, r).is_err());
+    }
+
+    fn fake_match(file: &str, family: &str, weight: i32, slant: i32) -> FontMatch {
+        FontMatch {
+            path: file.into(),
+            index: 0,
+            family: family.into(),
+            style: String::new(),
+            pixel_size: 16.0,
+            weight,
+            slant,
+            rendering: Rendering::default(),
+        }
+    }
+
+    #[test]
+    fn real_faces_are_told_from_substitutes() {
+        use fontconfig::{SLANT_ITALIC, SLANT_ROMAN, WEIGHT_BOLD, WEIGHT_REGULAR};
+        let regular = fake_match("r.ttf", "Mono", WEIGHT_REGULAR, SLANT_ROMAN);
+        let real = |m: &FontMatch, face| is_real_face(&regular, m, face);
+        let bold = fake_match("b.ttf", "Mono", WEIGHT_BOLD, SLANT_ROMAN);
+        let italic = fake_match("i.ttf", "Mono", WEIGHT_REGULAR, SLANT_ITALIC);
+        let bold_italic = fake_match("bi.ttf", "Mono", WEIGHT_BOLD, SLANT_ITALIC);
+        assert!(real(&bold, Face::Bold));
+        assert!(real(&italic, Face::Italic));
+        assert!(real(&bold_italic, Face::BoldItalic));
+        // The regular face again (no such face in the family).
+        assert!(!real(&regular, Face::Bold));
+        // Wrong weight or slant for what was asked.
+        assert!(!real(&bold_italic, Face::Italic));
+        assert!(!real(&italic, Face::BoldItalic));
+        assert!(!real(&bold, Face::BoldItalic));
+        // Another family.
+        let other = fake_match("o.ttf", "Other Mono", WEIGHT_BOLD, SLANT_ROMAN);
+        assert!(!real(&other, Face::Bold));
+        // One file for every face (a variable font).
+        let variable = fake_match("r.ttf", "Mono", WEIGHT_BOLD, SLANT_ROMAN);
+        assert!(!real(&variable, Face::Bold));
+    }
+
+    #[test]
+    fn font_set_has_every_face_at_one_size() {
+        let config = fontconfig::Config::new().unwrap();
+        let set = FontSet::load(&config, "monospace:pixelsize=20", 96.0).unwrap();
+        let regular = set.regular();
+        assert!(regular.synthetic().is_none());
+        for face in Face::ALL {
+            let font = set.face(face);
+            assert_eq!(font.size(), regular.size(), "{face:?}");
+            let s = font.synthetic();
+            // Synthesized only for the missing part.
+            if !face.is_bold() {
+                assert_eq!(s.embolden, 0.0, "{face:?}");
+            }
+            if !face.is_italic() {
+                assert_eq!(s.skew, 0.0, "{face:?}");
+            }
+            assert!(!font.name().is_empty(), "{face:?}");
+        }
+        assert_eq!(set.cell(), regular.cell());
+    }
+
+    #[test]
+    fn synthesized_faces() {
+        let set = FontSet::from_regular(monospace("monospace:pixelsize=20")).unwrap();
+        let s = |f| set.face(f).synthetic();
+        assert_eq!(s(Face::Bold).embolden, 1.0);
+        assert_eq!(s(Face::Italic).skew, Synthetic::ITALIC_SKEW);
+        assert_eq!(
+            s(Face::BoldItalic),
+            Synthetic {
+                embolden: 1.0,
+                skew: Synthetic::ITALIC_SKEW
+            }
+        );
+
+        // Italic: every point sheared by its height above the baseline.
+        let outline = |face| {
+            let font = set.face(face);
+            font.glyph(font.glyph_id('l').unwrap()).unwrap().outline
+        };
+        let (regular, italic) = (outline(Face::Regular), outline(Face::Italic));
+        assert_eq!(regular.lines.len(), italic.lines.len());
+        // Back to font space: x right, y up from the baseline at the pen.
+        let font_space = |o: &Outline, p: [f32; 2]| [p[0] + o.left as f32, -(p[1] + o.top as f32)];
+        for (r, i) in regular.lines.iter().zip(&italic.lines) {
+            for (rp, ip) in [(r.p0, i.p0), (r.p1, i.p1)] {
+                let (rp, ip) = (font_space(&regular, rp), font_space(&italic, ip));
+                assert!((ip[1] - rp[1]).abs() < 1e-3, "{rp:?} {ip:?}");
+                let expected = rp[0] + Synthetic::ITALIC_SKEW * rp[1];
+                assert!((ip[0] - expected).abs() < 1e-3, "{rp:?} {ip:?}");
+            }
+        }
+        // Bold: one pixel wider, twice the lines.
+        let bold = outline(Face::Bold);
+        assert_eq!(bold.width, regular.width + 1);
+        assert_eq!(bold.lines.len(), 2 * regular.lines.len());
     }
 }

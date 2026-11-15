@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use skrifa::GlyphId;
 
-use crate::font::{CellMetrics, Font, Stroke};
+use crate::font::{CellMetrics, Face, FontSet, Stroke};
 use crate::raster::{AtlasFull, Rasterizer, Rect};
 use crate::spirv;
 use crate::term::palette::Rgb;
@@ -139,10 +139,10 @@ struct Placed {
 
 pub struct TextRenderer {
     device: Arc<Device>,
-    font: Font,
+    fonts: FontSet,
     raster: Rasterizer,
     /// `None`: the character draws nothing (e.g. space).
-    cache: HashMap<char, Option<Placed>>,
+    cache: HashMap<(Face, char), Option<Placed>>,
     pipeline: Arc<GraphicsPipeline>,
     set: Arc<DescriptorSet>,
     /// Scratch for building a frame's instances, in drawing order.
@@ -156,13 +156,18 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     /// `slots`: how many frames can be in flight (one per scanout buffer).
-    pub fn new(device: &Arc<Device>, font: Font, format: vk::Format, slots: usize) -> Result<Self> {
-        Self::with_atlas(device, font, format, slots, ATLAS_SIZE, ATLAS_SIZE)
+    pub fn new(
+        device: &Arc<Device>,
+        fonts: FontSet,
+        format: vk::Format,
+        slots: usize,
+    ) -> Result<Self> {
+        Self::with_atlas(device, fonts, format, slots, ATLAS_SIZE, ATLAS_SIZE)
     }
 
     fn with_atlas(
         device: &Arc<Device>,
-        font: Font,
+        fonts: FontSet,
         format: vk::Format,
         slots: usize,
         atlas_width: u32,
@@ -180,7 +185,7 @@ impl TextRenderer {
         let set = DescriptorSet::new(&layout, &[raster.atlas()])?;
         Ok(Self {
             device: device.clone(),
-            font,
+            fonts,
             raster,
             cache: HashMap::new(),
             pipeline,
@@ -192,7 +197,7 @@ impl TextRenderer {
     }
 
     pub fn cell(&self) -> CellMetrics {
-        self.font.cell()
+        self.fonts.cell()
     }
 
     /// Record a frame of `term`'s screen into `target`, using instance
@@ -243,7 +248,7 @@ impl TextRenderer {
     fn build(&mut self, term: &Terminal) -> Result<()> {
         self.instances.clear();
         self.decorations.clear();
-        backgrounds(&mut self.instances, term, self.font.cell());
+        backgrounds(&mut self.instances, term, self.fonts.cell());
         let palette = term.palette();
         let cell = self.cell();
         for row in 0..term.rows() {
@@ -254,7 +259,7 @@ impl TextRenderer {
                 }
                 let (fg, _) = resolve(palette, &c.style);
                 if c.ch != ' '
-                    && let Some(p) = self.glyph(c.ch)?
+                    && let Some(p) = self.glyph(face_of(&c.style), c.ch)?
                 {
                     self.instances.push(Instance::glyph(col, row, p, fg));
                 }
@@ -290,7 +295,7 @@ impl TextRenderer {
                 let (_, bg) = resolve(palette, &c.style);
                 if c.ch != ' '
                     && !c.style.flags.contains(Flags::HIDDEN)
-                    && let Some(p) = self.glyph(c.ch)?
+                    && let Some(p) = self.glyph(face_of(&c.style), c.ch)?
                 {
                     self.instances.push(Instance::glyph(col, row, p, bg));
                 }
@@ -319,21 +324,22 @@ impl TextRenderer {
     }
 
     /// The atlas placement for `ch`, rasterizing it if new.
-    fn glyph(&mut self, ch: char) -> Result<Option<Placed>> {
-        if let Some(&placed) = self.cache.get(&ch) {
+    fn glyph(&mut self, face: Face, ch: char) -> Result<Option<Placed>> {
+        if let Some(&placed) = self.cache.get(&(face, ch)) {
             return Ok(placed);
         }
+        let font = self.fonts.face(face);
         // Missing characters show the font's .notdef glyph (usually a box).
-        let id = self.font.glyph_id(ch).unwrap_or(GlyphId::NOTDEF);
-        let glyph = self.font.glyph(id)?;
+        let id = font.glyph_id(ch).unwrap_or(GlyphId::NOTDEF);
+        let glyph = font.glyph(id)?;
         let placed = self.raster.queue(&glyph.outline)?.map(|rect| Placed {
             rect,
             offset: (
                 glyph.outline.left,
-                self.font.cell().baseline as i32 + glyph.outline.top,
+                self.fonts.cell().baseline as i32 + glyph.outline.top,
             ),
         });
-        self.cache.insert(ch, placed);
+        self.cache.insert((face, ch), placed);
         Ok(placed)
     }
 
@@ -355,6 +361,14 @@ impl TextRenderer {
             }
         }
     }
+}
+
+/// The face SGR bold and italic select.
+fn face_of(style: &Style) -> Face {
+    Face::new(
+        style.flags.contains(Flags::BOLD),
+        style.flags.contains(Flags::ITALIC),
+    )
 }
 
 /// Solid quads for backgrounds that aren't the default one (that's the
@@ -639,12 +653,10 @@ mod tests {
             let device =
                 Device::for_drm_node(&instance, rustix::fs::major(rdev), rustix::fs::minor(rdev))
                     .unwrap();
-            let m = fontconfig::Config::new()
-                .unwrap()
-                .match_font("monospace:pixelsize=16", 96.0)
-                .unwrap();
-            let font = Font::load(&m).unwrap();
-            let cell = font.cell();
+            let config = fontconfig::Config::new().unwrap();
+            let fonts = FontSet::load(&config, "monospace:pixelsize=16", 96.0).unwrap();
+            let cell = fonts.cell();
+            let font = fonts.regular();
             let (aw, ah) = match atlas_for {
                 Some(screens) => {
                     let size = |ch| {
@@ -667,7 +679,8 @@ mod tests {
                 None => (ATLAS_SIZE, ATLAS_SIZE),
             };
             let renderer =
-                TextRenderer::with_atlas(&device, font, Format::R8G8B8A8_UNORM, 1, aw, ah).unwrap();
+                TextRenderer::with_atlas(&device, fonts, Format::R8G8B8A8_UNORM, 1, aw, ah)
+                    .unwrap();
             Self {
                 device,
                 renderer,
@@ -795,8 +808,9 @@ mod tests {
                     \x1b[31mred \x1b[32mgreen \x1b[33myellow \x1b[34mblue \x1b[35mmagenta \x1b[36mcyan\x1b[m\r\n\
                     \x1b[41m bg \x1b[42m bg \x1b[44m bg \x1b[48;2;80;40;120m truecolor \x1b[m \x1b[7m inverse \x1b[m \x1b[2mdim\x1b[m\r\n\
                     \x1b[4munder\x1b[m \x1b[21mdouble\x1b[m \x1b[4:3;58;5;9mcurly\x1b[m \x1b[9mstrike\x1b[m \x1b[53mover\x1b[m\r\n\
+                    regular \x1b[1mbold\x1b[m \x1b[3mitalic\x1b[m \x1b[1;3mbold italic\x1b[m \x1b[1;31mbold red\x1b[m\r\n\
                     \x1b(0lqqqwqqqk\r\nx   x   x\r\nmqqqvqqqj\x1b(B $ ";
-        let f = Fixture::new(None).frame(text.as_bytes(), 50, 11).unwrap();
+        let f = Fixture::new(None).frame(text.as_bytes(), 50, 12).unwrap();
         assert!((0..10).all(|c| f.ink(c, 1) > 0 || c == 3 || c == 9));
     }
 
@@ -904,5 +918,21 @@ mod tests {
         assert_eq!(block.at(0, 0, 0, 0), RED);
         assert!(pixels.iter().all(|&(_, _, px)| px[1] == 0 && px[2] == 0));
         assert!(pixels.iter().any(|&(_, _, px)| px[0] < 64), "glyph visible");
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn bold_and_italic_use_their_own_faces() {
+        let mut fixture = Fixture::new(None);
+        let f = fixture
+            .frame(b"H\x1b[1mH\x1b[22;3mH\x1b[1mH\x1b[?25l", 5, 1)
+            .unwrap();
+        let (regular, bold) = (f.ink(0, 0), f.ink(1, 0));
+        assert!(bold > regular * 11 / 10, "bold {bold} vs regular {regular}");
+        // Italic H: a different shape, about the same amount of ink.
+        let italic = f.cell_pixels(2, 0);
+        assert_ne!(italic, f.cell_pixels(0, 0));
+        assert!(f.ink(3, 0) > f.ink(2, 0), "bold italic heavier than italic");
+        assert_eq!(fixture.renderer.cache.len(), 4, "one entry per face");
     }
 }

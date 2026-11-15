@@ -4,6 +4,10 @@
 //! y up. The rasterizer only knows straight lines, so curves are split into
 //! enough segments that no point strays more than `tolerance` pixels from
 //! the true curve. Output is y down with the bitmap's top-left at (0, 0).
+//!
+//! Faces a font family lacks can be faked here ([`Synthetic`]): italic by
+//! shearing the lines, bold by adding a copy shifted right. With nonzero
+//! winding, overlapping copies fill as one shape.
 
 use skrifa::outline::OutlinePen;
 
@@ -41,6 +45,30 @@ pub const TOLERANCE: f32 = 0.15;
 
 type Point = [f32; 2];
 
+/// How to fake a missing bold or italic face.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Synthetic {
+    /// Widen strokes by this many pixels (to the right).
+    pub embolden: f32,
+    /// Lean right by this much per pixel above the baseline.
+    pub skew: f32,
+}
+
+impl Synthetic {
+    /// FreeType's slant for synthetic obliques (`FT_GlyphSlot_Oblique`).
+    pub const ITALIC_SKEW: f32 = 0.2;
+
+    /// FreeType's emboldening at `size` pixels (`FT_GlyphSlot_Embolden`,
+    /// 1/24 em), at least a pixel so it shows.
+    pub fn embolden_for(size: f32) -> f32 {
+        (size / 24.0).round().max(1.0)
+    }
+
+    pub fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// An [`OutlinePen`] that flattens what it's given. Feed it a glyph with
 /// skrifa's `OutlineGlyph::draw`, then call [`Flattener::finish`].
 pub struct Flattener {
@@ -50,12 +78,18 @@ pub struct Flattener {
     start: Point,
     current: Point,
     open: bool,
+    synthetic: Synthetic,
 }
 
 impl Flattener {
     pub fn new(tolerance: f32) -> Self {
+        Self::with_synthetic(tolerance, Synthetic::default())
+    }
+
+    pub fn with_synthetic(tolerance: f32, synthetic: Synthetic) -> Self {
         Self {
             tolerance,
+            synthetic,
             lines: Vec::new(),
             start: [0.0; 2],
             current: [0.0; 2],
@@ -83,11 +117,32 @@ impl Flattener {
         ((k * dd / (8.0 * self.tolerance)).sqrt().ceil() as u32).max(1)
     }
 
-    /// The bitmap: flip y, pad, and move the top-left corner to (0, 0).
+    /// The bitmap: fake bold/italic if asked, flip y, pad, and move the
+    /// top-left corner to (0, 0).
     pub fn finish(mut self) -> Outline {
         self.close();
         if self.lines.is_empty() {
             return Outline::default();
+        }
+        let Synthetic { embolden, skew } = self.synthetic;
+        if skew != 0.0 {
+            // Still y up from the baseline: shear around it.
+            for line in &mut self.lines {
+                for p in [&mut line.p0, &mut line.p1] {
+                    p[0] += skew * p[1];
+                }
+            }
+        }
+        if embolden > 0.0 {
+            let shifted: Vec<Line> = self
+                .lines
+                .iter()
+                .map(|l| Line {
+                    p0: [l.p0[0] + embolden, l.p0[1]],
+                    p1: [l.p1[0] + embolden, l.p1[1]],
+                })
+                .collect();
+            self.lines.extend(shifted);
         }
         let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
         for line in &mut self.lines {
@@ -215,6 +270,61 @@ mod tests {
                 p1: [2.0 + pad, 3.0 + pad]
             }
         );
+    }
+
+    fn unit_box(p: &mut Flattener) {
+        // 2x4 px box on the baseline at the pen.
+        p.move_to(0.0, 0.0);
+        p.line_to(2.0, 0.0);
+        p.line_to(2.0, 4.0);
+        p.line_to(0.0, 4.0);
+        p.close();
+    }
+
+    #[test]
+    fn synthetic_bold_adds_a_shifted_copy() {
+        let plain = flatten(unit_box);
+        let mut pen = Flattener::with_synthetic(
+            TOLERANCE,
+            Synthetic {
+                embolden: 1.0,
+                skew: 0.0,
+            },
+        );
+        unit_box(&mut pen);
+        let bold = pen.finish();
+        assert_eq!(bold.lines.len(), 2 * plain.lines.len());
+        assert_eq!(bold.width, plain.width + 1);
+        assert_eq!(
+            (bold.left, bold.top, bold.height),
+            (plain.left, plain.top, plain.height)
+        );
+    }
+
+    #[test]
+    fn synthetic_italic_leans_right_above_the_baseline() {
+        let mut pen = Flattener::with_synthetic(
+            TOLERANCE,
+            Synthetic {
+                embolden: 0.0,
+                skew: 0.5,
+            },
+        );
+        unit_box(&mut pen);
+        let o = pen.finish();
+        let pad = PADDING as f32;
+        // The baseline edge stays put; the top edge (4 px up) moves 2 px.
+        assert_eq!(o.lines[0].p0, [pad, 4.0 + pad]);
+        assert_eq!(o.lines[2].p0, [2.0 + 2.0 + pad, pad]);
+        assert_eq!(o.width, 4 + 2 * PADDING as u32);
+        assert_eq!(o.left, -PADDING);
+    }
+
+    #[test]
+    fn embolden_amount_follows_size() {
+        assert_eq!(Synthetic::embolden_for(10.0), 1.0);
+        assert_eq!(Synthetic::embolden_for(24.0), 1.0);
+        assert_eq!(Synthetic::embolden_for(48.0), 2.0);
     }
 
     #[test]
