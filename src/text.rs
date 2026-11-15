@@ -7,7 +7,9 @@
 //! primitive order, so instances are layered by their order in the buffer:
 //!
 //! 1. cell backgrounds that differ from the default (solid quads, one per
-//!    run of equal color in a row);
+//!    run of equal color in a row). Runs at the edge of the grid extend
+//!    over the margin to the screen's edge, so a program's background
+//!    fills the screen instead of leaving a frame of the default one;
 //! 2. glyphs, each in its cell's foreground;
 //! 3. decorations: underline, strikeout, overline (solid quads);
 //! 4. the cursor (an inverted block redraws the glyph in the cell's
@@ -54,12 +56,13 @@ unsafe impl Pod for Instance {}
 
 impl Instance {
     /// A filled rectangle `size` pixels big, `offset` from the top-left of
-    /// cell (`col`, `row`).
-    fn solid(col: u16, row: u16, offset: (u32, u32), size: (u32, u32), color: Rgb) -> Self {
+    /// cell (`col`, `row`) (negative reaches into the margin).
+    fn solid(col: u16, row: u16, offset: (i32, i32), size: (u32, u32), color: Rgb) -> Self {
         let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+        let signed = |v: i32| v.clamp(i16::MIN.into(), i16::MAX.into());
         Self {
             cell: pack(col, row),
-            offset: pack(clamp(offset.0), clamp(offset.1)),
+            offset: pack_signed(signed(offset.0), signed(offset.1)),
             atlas: 0,
             size: pack(clamp(size.0), clamp(size.1)),
             color: pack_color(color),
@@ -209,7 +212,9 @@ impl TextRenderer {
         slot: usize,
         term: &Terminal,
     ) -> Result<()> {
-        if let Err(e) = self.build(term) {
+        let (width, height) = target.size();
+        let margins = Margins::new(self.cell(), term, width, height);
+        if let Err(e) = self.build(term, margins) {
             if e.downcast_ref::<AtlasFull>().is_none() {
                 return Err(e);
             }
@@ -217,7 +222,7 @@ impl TextRenderer {
             tracing::debug!(glyphs = self.cache.len(), "glyph atlas full; clearing it");
             self.raster.clear();
             self.cache.clear();
-            self.build(term)
+            self.build(term, margins)
                 .context("the glyphs on screen don't fit in the atlas")?;
         }
         self.raster.record(rec)?;
@@ -227,13 +232,12 @@ impl TextRenderer {
         buffer.write(0, &self.instances)?;
         rec.using(&[&buffer]);
 
-        let (width, height) = target.size();
         let cell = self.cell();
         let push = Push {
             instances: buffer.address(),
             screen: [width, height],
             cell: [cell.width, cell.height],
-            origin: grid_origin(cell, term, width, height),
+            origin: [margins.left, margins.top],
         };
         let bg = term.palette().background.map(|c| f32::from(c) / 255.0);
         rec.begin_rendering(target, Some([bg[0], bg[1], bg[2], 1.0]))?;
@@ -245,10 +249,10 @@ impl TextRenderer {
 
     /// Fill `self.instances` for `term`, queueing new glyphs. Fails with
     /// [`AtlasFull`] (inside the anyhow error) when the atlas runs out.
-    fn build(&mut self, term: &Terminal) -> Result<()> {
+    fn build(&mut self, term: &Terminal, margins: Margins) -> Result<()> {
         self.instances.clear();
         self.decorations.clear();
-        backgrounds(&mut self.instances, term, self.fonts.cell());
+        backgrounds(&mut self.instances, term, self.fonts.cell(), margins);
         let palette = term.palette();
         let cell = self.cell();
         for row in 0..term.rows() {
@@ -305,7 +309,7 @@ impl TextRenderer {
                 self.instances.push(Instance::solid(
                     col,
                     row,
-                    (0, cell.height - thin),
+                    (0, (cell.height - thin) as i32),
                     (cell.width, thin),
                     color,
                 ));
@@ -372,10 +376,14 @@ fn face_of(style: &Style) -> Face {
 }
 
 /// Solid quads for backgrounds that aren't the default one (that's the
-/// clear color), merged into runs along each row.
-fn backgrounds(out: &mut Vec<Instance>, term: &Terminal, cell: CellMetrics) {
+/// clear color), merged into runs along each row. Runs in the first or last
+/// column or row also cover the margin beside them, corners included.
+fn backgrounds(out: &mut Vec<Instance>, term: &Terminal, cell: CellMetrics, margins: Margins) {
     let palette = term.palette();
-    for row in 0..term.rows() {
+    let (cols, rows) = (term.cols(), term.rows());
+    for row in 0..rows {
+        let top = if row == 0 { margins.top } else { 0 };
+        let bottom = if row == rows - 1 { margins.bottom } else { 0 };
         let mut run: Option<(u16, Rgb)> = None;
         for col in 0..=term.cols() {
             let bg = (col < term.cols())
@@ -385,12 +393,14 @@ fn backgrounds(out: &mut Vec<Instance>, term: &Terminal, cell: CellMetrics) {
                 if bg == Some(color) {
                     continue;
                 }
+                let left = if start == 0 { margins.left } else { 0 };
+                let right = if col == cols { margins.right } else { 0 };
                 let width = u32::from(col - start) * cell.width;
                 out.push(Instance::solid(
                     start,
                     row,
-                    (0, 0),
-                    (width, cell.height),
+                    (-(left as i32), -(top as i32)),
+                    (left + width + right, top + cell.height + bottom),
                     color,
                 ));
             }
@@ -414,7 +424,7 @@ fn decorations(
         out.push(Instance::solid(
             col,
             row,
-            (0, s.top),
+            (0, s.top as i32),
             (cell.width, s.thickness),
             color,
         ));
@@ -462,14 +472,27 @@ pub fn grid_size(cell: CellMetrics, width: u32, height: u32) -> (u16, u16) {
     (cols as u16, rows as u16)
 }
 
-/// Top-left of the grid: centred, splitting the leftover pixels.
-fn grid_origin(cell: CellMetrics, term: &Terminal, width: u32, height: u32) -> [u32; 2] {
-    let used_w = cell.width * u32::from(term.cols());
-    let used_h = cell.height * u32::from(term.rows());
-    [
-        width.saturating_sub(used_w) / 2,
-        height.saturating_sub(used_h) / 2,
-    ]
+/// The pixels around the grid: it's centred, splitting what's left over
+/// (the right and bottom get the odd pixel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Margins {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl Margins {
+    fn new(cell: CellMetrics, term: &Terminal, width: u32, height: u32) -> Self {
+        let spare_w = width.saturating_sub(cell.width * u32::from(term.cols()));
+        let spare_h = height.saturating_sub(cell.height * u32::from(term.rows()));
+        Self {
+            left: spare_w / 2,
+            top: spare_h / 2,
+            right: spare_w - spare_w / 2,
+            bottom: spare_h - spare_h / 2,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -534,13 +557,45 @@ mod tests {
     }
 
     #[test]
+    fn edge_backgrounds_cover_the_margins() {
+        let mut term = Terminal::new(4, 3);
+        // Row 0: red across (both edges); row 1: blue in the middle only;
+        // row 2: green at the left edge only.
+        term.feed(b"\x1b[41m    \x1b[m\r\n \x1b[44m  \x1b[m \r\n\x1b[42m \x1b[m");
+        let margins = Margins {
+            left: 2,
+            top: 3,
+            right: 4,
+            bottom: 5,
+        };
+        let mut out = Vec::new();
+        backgrounds(&mut out, &term, CELL, margins);
+        let offset = |i: &Instance| ((i.offset << 16) as i32 >> 16, i.offset as i32 >> 16);
+        let quads: Vec<_> = out
+            .iter()
+            .map(|i| (unpack(i.cell), offset(i), unpack(i.size)))
+            .collect();
+        assert_eq!(
+            quads,
+            [
+                // Top row, full width: the top margin and both sides.
+                ((0, 0), (-2, -3), (2 + 40 + 4, 3 + 20)),
+                // Inside: unchanged.
+                ((1, 1), (0, 0), (20, 20)),
+                // Bottom-left: the left and bottom margins.
+                ((0, 2), (-2, 0), (2 + 10, 20 + 5)),
+            ]
+        );
+    }
+
+    #[test]
     fn backgrounds_merge_into_runs() {
         let mut term = Terminal::new(8, 2);
         // Red for 3 cells, a default cell, blue for 2, then red again;
         // second row: inverse makes the default foreground a background.
         term.feed(b"\x1b[41m   \x1b[m \x1b[44m  \x1b[41m \r\n\x1b[7mab");
         let mut out = Vec::new();
-        backgrounds(&mut out, &term, CELL);
+        backgrounds(&mut out, &term, CELL, Margins::default());
         let p = term.palette();
         let runs: Vec<_> = out
             .iter()
@@ -625,8 +680,16 @@ mod tests {
         assert_eq!(grid_size(CELL, 105, 41), (10, 2));
         assert_eq!(grid_size(CELL, 3, 3), (1, 1));
         let term = Terminal::new(10, 2);
-        assert_eq!(grid_origin(CELL, &term, 105, 41), [2, 0]);
-        assert_eq!(grid_origin(CELL, &term, 100, 40), [0, 0]);
+        assert_eq!(
+            Margins::new(CELL, &term, 105, 41),
+            Margins {
+                left: 2,
+                top: 0,
+                right: 3,
+                bottom: 1
+            }
+        );
+        assert_eq!(Margins::new(CELL, &term, 100, 40), Margins::default());
     }
 
     /// White text on black, red cursor, rendered offscreen and read back.
@@ -689,11 +752,23 @@ mod tests {
         }
 
         fn frame(&mut self, text: &[u8], cols: u16, rows: u16) -> Result<Frame> {
-            let device = &self.device;
             let (width, height) = (
                 self.cell.width * u32::from(cols),
                 self.cell.height * u32::from(rows),
             );
+            self.frame_in(text, cols, rows, width, height)
+        }
+
+        /// A frame `width` x `height` pixels, with the grid centred in it.
+        fn frame_in(
+            &mut self,
+            text: &[u8],
+            cols: u16,
+            rows: u16,
+            width: u32,
+            height: u32,
+        ) -> Result<Frame> {
+            let device = &self.device;
             let target = Image::new(
                 device,
                 width,
@@ -797,6 +872,31 @@ mod tests {
         assert!(f.ink(1, 1) < f.ink(0, 0), "i has less ink than a");
         assert!(f.is_cursor(2, 1));
         assert!(!f.is_cursor(0, 0));
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn a_full_screen_background_reaches_the_edges() {
+        // What Emacs does: every cell black-on-black explicitly, on a
+        // terminal whose default background is gray. The 2x2 grid sits in
+        // the middle of a target 7 px wider and 5 px taller.
+        let mut fixture = Fixture::new(None);
+        let cell = fixture.cell;
+        let (w, h) = (cell.width * 2 + 7, cell.height * 2 + 5);
+        let text = b"\x1b]11;#808080\x07\x1b[?25l\x1b[44m    ";
+        let f = fixture.frame_in(text, 2, 2, w, h).unwrap();
+        let blue = [0x34, 0x65, 0xa4, 255];
+        let px = |x: u32, y: u32| f.pixels[(y * w + x) as usize];
+        for (x, y) in [
+            (0, 0),
+            (w - 1, 0),
+            (0, h - 1),
+            (w - 1, h - 1),
+            (w / 2, 0),
+            (0, h / 2),
+        ] {
+            assert_eq!(px(x, y), blue, "({x}, {y})");
+        }
     }
 
     /// A sample screen, mostly for VELLUM_DUMP_FRAME.
