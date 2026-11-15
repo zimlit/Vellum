@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod dmabuf;
 pub mod event;
+pub mod font;
 pub mod frontend;
 pub mod gbm;
 pub mod kms;
