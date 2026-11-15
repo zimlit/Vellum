@@ -747,3 +747,102 @@ fn replies_survive_splits_in_order() {
         assert_eq!(t.take_replies(), expected, "split at {split}");
     }
 }
+
+/// The view's rows' text.
+fn view(t: &Terminal) -> Vec<String> {
+    (0..t.rows()).map(|r| t.view_line(r).text()).collect()
+}
+
+#[test]
+fn view_stitches_scrollback_and_screen() {
+    // Lines 0-19 on 3 rows: 0-16 scrolled off, 17-19 on screen.
+    let mut t = term(5, 3, &numbered(20));
+    assert_eq!(t.scrollback().len(), 17);
+    assert_eq!(view(&t), ["17", "18", "19"], "live");
+    t.scroll_view(2);
+    assert_eq!(t.view_offset(), 2);
+    assert_eq!(
+        view(&t),
+        ["15", "16", "17"],
+        "two from history, one from the screen"
+    );
+    // Scrollback lines are trimmed; the rest of the row reads as blank.
+    assert_eq!(t.view_cell(4, 0), Cell::default());
+    assert_eq!(t.view_cell(0, 0).ch, '1');
+}
+
+#[test]
+fn view_offset_is_clamped() {
+    let mut t = term(5, 3, &numbered(20));
+    t.scroll_view(1000);
+    assert_eq!(t.view_offset(), 17);
+    assert_eq!(view(&t), ["0", "1", "2"], "the oldest line at the top");
+    t.scroll_view(-5);
+    assert_eq!(t.view_offset(), 12);
+    t.scroll_view(-1000);
+    assert_eq!(t.view_offset(), 0);
+    // Nothing to scroll back to.
+    let mut empty = term(5, 3, "hi");
+    empty.scroll_view(3);
+    assert_eq!(empty.view_offset(), 0);
+}
+
+#[test]
+fn view_stays_on_its_lines_while_output_arrives() {
+    let mut t = term(5, 3, &numbered(20));
+    t.scroll_view(2);
+    t.feed(b"\r\nnew\r\nnewer");
+    assert_eq!(t.view_offset(), 4);
+    assert_eq!(view(&t), ["15", "16", "17"]);
+    // At the live screen, the view follows the output.
+    t.reset_view();
+    t.feed(b"\r\nlast");
+    assert_eq!(t.view_offset(), 0);
+    assert_eq!(view(&t), ["new", "newer", "last"]);
+}
+
+#[test]
+fn view_stays_put_with_a_full_scrollback() {
+    // Only 5 lines kept: each new one drops the oldest.
+    let mut t = Terminal::with_scrollback(5, 2, 5);
+    t.feed(numbered(10).as_bytes());
+    t.scroll_view(3);
+    assert_eq!(view(&t), ["5", "6"]);
+    t.feed(b"\r\nx");
+    assert_eq!(view(&t), ["5", "6"], "same lines, now one further back");
+    t.feed(b"\r\ny\r\nz");
+    assert_eq!(t.view_offset(), 5);
+    assert_eq!(view(&t), ["6", "7"], "the top line is the oldest kept");
+}
+
+#[test]
+fn scrolling_inside_a_region_leaves_the_view_alone() {
+    let mut t = term(5, 4, &numbered(10));
+    t.scroll_view(2);
+    t.feed(b"\x1b[2;3r\x1b[3;1H\n\n\n");
+    assert_eq!(t.view_offset(), 2);
+    assert_eq!(t.scrollback().len(), 6);
+}
+
+#[test]
+fn view_resets_on_alternate_screen_and_clears() {
+    for (seq, what) in [
+        ("\x1b[?1049h", "1049"),
+        ("\x1b[?1047h", "1047"),
+        ("\x1b[?47h", "47"),
+        ("\x1b[3J", "ED 3"),
+        ("\x1bc", "RIS"),
+    ] {
+        let mut t = term(5, 3, &numbered(20));
+        t.scroll_view(4);
+        t.feed(seq.as_bytes());
+        assert_eq!(t.view_offset(), 0, "{what}");
+    }
+    // No scrolling back on the alternate screen, nor once back from it.
+    let mut t = term(5, 3, &numbered(20));
+    t.feed(b"\x1b[?1049h");
+    t.scroll_view(4);
+    assert_eq!(t.view_offset(), 0);
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(view(&t), ["17", "18", "19"]);
+}

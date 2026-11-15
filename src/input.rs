@@ -508,11 +508,28 @@ pub enum Binding {
     Exit,
     /// Ctrl+Alt+F1..F12: switch to that VT (step 7).
     SwitchVt(u8),
+    /// Shift+PgUp/PgDn/Home/End: move the view through the scrollback.
+    /// Only on the primary screen; on the alternate screen the program gets
+    /// the key.
+    Scroll(Scroll),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    /// Half a screen back.
+    PageUp,
+    /// Half a screen forward.
+    PageDown,
+    /// The oldest line.
+    Top,
+    /// The live screen.
+    Bottom,
 }
 
 /// The binding for `event`, if it's one of vellum's own keys.
 pub fn binding(event: &KeyEvent) -> Option<Binding> {
     let ctrl_alt = event.mods.contains(Mods::CTRL | Mods::ALT);
+    let shift_only = event.mods.without(Mods::LOCKS) == Mods::SHIFT;
     let raw = event.sym.raw();
     let f1 = Keysym::F1.raw();
     let vt1 = Keysym::XF86_Switch_VT_1.raw();
@@ -525,6 +542,12 @@ pub fn binding(event: &KeyEvent) -> Option<Binding> {
         _ if ctrl_alt && (f1..f1 + 12).contains(&raw) => {
             Some(Binding::SwitchVt((raw - f1 + 1) as u8))
         }
+        Keysym::Page_Up | Keysym::KP_Page_Up if shift_only => Some(Binding::Scroll(Scroll::PageUp)),
+        Keysym::Page_Down | Keysym::KP_Page_Down if shift_only => {
+            Some(Binding::Scroll(Scroll::PageDown))
+        }
+        Keysym::Home | Keysym::KP_Home if shift_only => Some(Binding::Scroll(Scroll::Top)),
+        Keysym::End | Keysym::KP_End if shift_only => Some(Binding::Scroll(Scroll::Bottom)),
         _ => None,
     }
 }

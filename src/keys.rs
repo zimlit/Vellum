@@ -50,7 +50,8 @@ impl Mods {
     pub const META: Self = Self(1 << 5);
     pub const CAPS_LOCK: Self = Self(1 << 6);
     pub const NUM_LOCK: Self = Self(1 << 7);
-    const LOCKS: Self = Self(Self::CAPS_LOCK.0 | Self::NUM_LOCK.0);
+    /// Caps Lock and Num Lock.
+    pub const LOCKS: Self = Self(Self::CAPS_LOCK.0 | Self::NUM_LOCK.0);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -68,7 +69,7 @@ impl Mods {
         self.0 == 0
     }
 
-    const fn without(self, other: Self) -> Self {
+    pub const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
 }

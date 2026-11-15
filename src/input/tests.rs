@@ -221,3 +221,27 @@ fn through_the_encoder() {
     let up = release(&mut kb, KEY_LEFTCTRL).unwrap();
     assert_eq!(encode(&up, &kitty).unwrap(), b"\x1b[57442;1:3u");
 }
+
+#[test]
+fn scroll_bindings() {
+    use crate::keys::KeyEvent;
+    let shift = Mods::SHIFT;
+    for (sym, want) in [
+        (Keysym::Page_Up, Scroll::PageUp),
+        (Keysym::Page_Down, Scroll::PageDown),
+        (Keysym::Home, Scroll::Top),
+        (Keysym::End, Scroll::Bottom),
+        (Keysym::KP_Page_Up, Scroll::PageUp),
+    ] {
+        assert_eq!(
+            binding(&KeyEvent::press(sym, shift)),
+            Some(Binding::Scroll(want))
+        );
+        // Lock keys don't get in the way.
+        let locked = KeyEvent::press(sym, shift | Mods::NUM_LOCK | Mods::CAPS_LOCK);
+        assert_eq!(binding(&locked), Some(Binding::Scroll(want)));
+        // Without Shift, or with more than Shift, the key is the program's.
+        assert_eq!(binding(&KeyEvent::press(sym, Mods::empty())), None);
+        assert_eq!(binding(&KeyEvent::press(sym, shift | Mods::CTRL)), None);
+    }
+}

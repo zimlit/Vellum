@@ -2,7 +2,8 @@
 //!
 //! Stored with trailing empty cells trimmed: most lines are short, and a
 //! cell is 20 bytes, so 10,000 full lines of a wide terminal would be tens
-//! of megabytes. Viewing comes with input (roadmap step 6).
+//! of megabytes. The terminal's view (`Terminal::view_line`) reads it
+//! while scrolled back with Shift+PgUp.
 
 use std::collections::VecDeque;
 

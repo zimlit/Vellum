@@ -30,7 +30,7 @@ use rustix::io::Errno;
 use crate::cli::Args;
 use crate::event::Poller;
 use crate::font::{Face, FontSet, fontconfig};
-use crate::input::{Binding, Devices, Key, KeyRepeat, Keyboard};
+use crate::input::{Binding, Devices, Key, KeyRepeat, Keyboard, Scroll};
 use crate::keys::{self, KeyEvent, KeyKind, KeyModes};
 use crate::kms::{self, Card};
 use crate::scanout::{
@@ -250,19 +250,24 @@ pub fn run(args: Args) -> Result<()> {
                         } else {
                             KeyKind::Release
                         };
-                        if let Some(event) = keyboard.key(code, kind)
-                            && on_key(&event, &term, &mut to_shell, &shell.master)?
-                        {
-                            break 'events;
+                        if let Some(event) = keyboard.key(code, kind) {
+                            match on_key(&event, &mut term, &mut to_shell, &shell.master)? {
+                                After::Exit => break 'events,
+                                After::Redraw => dirty = true,
+                                After::Nothing => {}
+                            }
                         }
                     }
                 }
                 REPEAT => {
                     if let Some(code) = repeat.expired().context("reading the repeat timer")?
                         && let Some(event) = keyboard.key(code, KeyKind::Repeat)
-                        && on_key(&event, &term, &mut to_shell, &shell.master)?
                     {
-                        break 'events;
+                        match on_key(&event, &mut term, &mut to_shell, &shell.master)? {
+                            After::Exit => break 'events,
+                            After::Redraw => dirty = true,
+                            After::Nothing => {}
+                        }
                     }
                 }
                 _ => unreachable!("unknown event token {token}"),
@@ -306,33 +311,70 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// What the event loop does after a key.
+enum After {
+    Nothing,
+    /// The screen changed (the view moved).
+    Redraw,
+    Exit,
+}
+
 /// Handle one key: vellum's own bindings, else encode it and queue it for
-/// the shell. Returns whether to exit.
+/// the shell.
 fn on_key(
     event: &KeyEvent,
-    term: &Terminal,
+    term: &mut Terminal,
     to_shell: &mut pty::Writer,
     master: &OwnedFd,
-) -> Result<bool> {
+) -> Result<After> {
+    let press = event.kind != KeyKind::Release;
     match crate::input::binding(event) {
         Some(Binding::Exit) if event.kind == KeyKind::Press => {
             tracing::info!("exiting on Ctrl+Alt+Backspace");
-            return Ok(true);
+            return Ok(After::Exit);
         }
         Some(Binding::SwitchVt(n)) if event.kind == KeyKind::Press => {
             tracing::info!(vt = n, "Ctrl+Alt+F{n}: VT switching is step 7; ignored");
-            return Ok(false);
+            return Ok(After::Nothing);
         }
-        Some(_) => return Ok(false),
+        // The alternate screen has no scrollback: the program gets these.
+        Some(Binding::Scroll(scroll)) if !term.alternate_screen() => {
+            if !press {
+                return Ok(After::Nothing);
+            }
+            let half = (term.rows() / 2).max(1) as isize;
+            let before = term.view_offset();
+            match scroll {
+                Scroll::PageUp => term.scroll_view(half),
+                Scroll::PageDown => term.scroll_view(-half),
+                Scroll::Top => term.scroll_view(isize::MAX),
+                Scroll::Bottom => term.reset_view(),
+            }
+            return Ok(if term.view_offset() == before {
+                After::Nothing
+            } else {
+                After::Redraw
+            });
+        }
+        Some(Binding::Scroll(_)) => {}
+        Some(_) => return Ok(After::Nothing),
         None => {}
     }
-    if let Some(bytes) = keys::encode(event, &KeyModes::of(term)) {
-        tracing::trace!(target: "vellum::pty", "key {:?}: {}", event.sym, bytes.escape_ascii());
-        to_shell
-            .send(master, &bytes)
-            .context("writing to the PTY")?;
+    let Some(bytes) = keys::encode(event, &KeyModes::of(term)) else {
+        return Ok(After::Nothing);
+    };
+    tracing::trace!(target: "vellum::pty", "key {:?}: {}", event.sym, bytes.escape_ascii());
+    to_shell
+        .send(master, &bytes)
+        .context("writing to the PTY")?;
+    // Typing goes back to the live screen. Not for releases or modifier
+    // keys (the kitty protocol reports those), or Shift+PgUp would snap
+    // back as soon as Shift was let go.
+    if press && !event.sym.is_modifier_key() && term.view_offset() > 0 {
+        term.reset_view();
+        return Ok(After::Redraw);
     }
-    Ok(false)
+    Ok(After::Nothing)
 }
 
 /// Read what the shell wrote into `buf`: `Some(bytes read)` (0 if nothing

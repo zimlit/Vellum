@@ -201,6 +201,9 @@ pub struct Terminal {
     /// The alternate screen is shown.
     alt: bool,
     scrollback: Scrollback,
+    /// How many lines back into the scrollback the view is (0: the live
+    /// screen). Always 0 on the alternate screen.
+    view_offset: usize,
     cursor: Cursor,
     /// DECSC state for the primary and alternate screens.
     saved: [Option<Saved>; 2],
@@ -242,6 +245,7 @@ impl Terminal {
             alternate: Screen::new(cols, rows),
             alt: false,
             scrollback: Scrollback::new(lines),
+            view_offset: 0,
             cursor: Cursor::default(),
             saved: [None; 2],
             top: 0,
@@ -343,6 +347,53 @@ impl Terminal {
     /// The program asked to hold back drawing (synchronized output).
     pub fn synchronized(&self) -> bool {
         self.modes.synchronized
+    }
+
+    /// How far back the view is scrolled, in lines (0: the live screen).
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// Scroll the view `lines` back into the scrollback (negative: towards
+    /// the live screen), within what there is. Only the primary screen has
+    /// a scrollback; on the alternate screen this does nothing.
+    pub fn scroll_view(&mut self, lines: isize) {
+        if self.alt {
+            return;
+        }
+        self.view_offset = self
+            .view_offset
+            .saturating_add_signed(lines)
+            .min(self.scrollback.len());
+    }
+
+    /// Back to the live screen.
+    pub fn reset_view(&mut self) {
+        self.view_offset = 0;
+    }
+
+    /// Row `row` of the view: from the scrollback while scrolled back, else
+    /// the screen. Scrollback lines can be shorter than the screen is wide
+    /// (see [`Terminal::view_cell`]).
+    pub fn view_line(&self, row: u16) -> &Line {
+        let back = self.scrollback.len();
+        // Row 0 of the view is line `back - offset` of history (scrollback
+        // then screen).
+        let line = back - self.view_offset + usize::from(row);
+        if line < back {
+            self.scrollback.line(line)
+        } else {
+            self.screen().line((line - back) as u16)
+        }
+    }
+
+    /// A cell of the view: blank past the end of a short scrollback line.
+    pub fn view_cell(&self, col: u16, row: u16) -> Cell {
+        self.view_line(row)
+            .cells
+            .get(usize::from(col))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Row `row`'s text, trailing blanks trimmed (tests and debugging).
@@ -492,6 +543,12 @@ impl Terminal {
         if !self.alt && top == 0 {
             for line in gone {
                 self.scrollback.push(line);
+                // Keep showing the same lines: one more is below the view
+                // now (or, with the scrollback full, the oldest went and
+                // everything moved up one).
+                if self.view_offset > 0 {
+                    self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+                }
             }
         }
     }
@@ -534,7 +591,10 @@ impl Terminal {
                 screen.erase(row, 0, col + 1, blank);
             }
             2 => screen.erase_rows(0, rows, blank),
-            3 => self.scrollback.clear(),
+            3 => {
+                self.scrollback.clear();
+                self.view_offset = 0;
+            }
             _ => self.unhandled(format!("ED {mode}")),
         }
     }
@@ -663,7 +723,10 @@ impl Terminal {
             }
             12 => self.cursor_blink = on,
             25 => m.cursor_visible = on,
-            47 => self.alt = on,
+            47 => {
+                self.alt = on;
+                self.view_offset = 0;
+            }
             66 => m.keypad_app = on,
             1000 | 1002 | 1003 => {
                 m.mouse = match (on, mode) {
@@ -685,6 +748,7 @@ impl Terminal {
             1047 => {
                 if on {
                     self.alt = true;
+                    self.view_offset = 0;
                 } else if self.alt {
                     self.clear_alternate();
                     self.alt = false;
@@ -701,6 +765,7 @@ impl Terminal {
                 if on && !self.alt {
                     self.save_cursor();
                     self.alt = true;
+                    self.view_offset = 0;
                     self.clear_alternate();
                 } else if !on && self.alt {
                     self.alt = false;

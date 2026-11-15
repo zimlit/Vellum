@@ -15,6 +15,9 @@
 //! 4. the cursor (an inverted block redraws the glyph in the cell's
 //!    background color on top of it).
 //!
+//! Rows come from the terminal's view ([`Terminal::view_line`]), which is
+//! the scrollback while scrolled back.
+//!
 //! See `shaders/cell.vert` and `shaders/cell.frag`. The whole screen is
 //! redrawn every frame; damage tracking comes later (roadmap step 9).
 
@@ -257,7 +260,7 @@ impl TextRenderer {
         let cell = self.cell();
         for row in 0..term.rows() {
             for col in 0..term.cols() {
-                let c = term.cell(col, row);
+                let c = term.view_cell(col, row);
                 if c.style.flags.contains(Flags::HIDDEN) {
                     continue;
                 }
@@ -276,7 +279,8 @@ impl TextRenderer {
 
     fn cursor(&mut self, term: &Terminal) -> Result<()> {
         let cursor = term.cursor();
-        if !cursor.visible {
+        // Scrolled back, the cursor's row isn't where it's drawn.
+        if !cursor.visible || term.view_offset() > 0 {
             return Ok(());
         }
         let palette = term.palette();
@@ -387,7 +391,7 @@ fn backgrounds(out: &mut Vec<Instance>, term: &Terminal, cell: CellMetrics, marg
         let mut run: Option<(u16, Rgb)> = None;
         for col in 0..=term.cols() {
             let bg = (col < term.cols())
-                .then(|| resolve(palette, &term.cell(col, row).style).1)
+                .then(|| resolve(palette, &term.view_cell(col, row).style).1)
                 .filter(|&bg| bg != palette.background);
             if let Some((start, color)) = run {
                 if bg == Some(color) {
@@ -768,6 +772,15 @@ mod tests {
             width: u32,
             height: u32,
         ) -> Result<Frame> {
+            let mut term = Terminal::new(cols, rows);
+            // White on black, red cursor.
+            term.feed(b"\x1b]10;#ffffff;#000000;#ff0000\x07");
+            term.feed(text);
+            self.render(&term, width, height)
+        }
+
+        /// Draw `term` into a `width` x `height` frame and read it back.
+        fn render(&mut self, term: &Terminal, width: u32, height: u32) -> Result<Frame> {
             let device = &self.device;
             let target = Image::new(
                 device,
@@ -776,10 +789,6 @@ mod tests {
                 Format::R8G8B8A8_UNORM,
                 ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC,
             )?;
-            let mut term = Terminal::new(cols, rows);
-            // White on black, red cursor.
-            term.feed(b"\x1b]10;#ffffff;#000000;#ff0000\x07");
-            term.feed(text);
             let out = Buffer::new(
                 device,
                 u64::from(width * height) * 4,
@@ -795,7 +804,7 @@ mod tests {
                 Access::NONE,
                 Access::COLOR_ATTACHMENT,
             );
-            self.renderer.draw(&mut rec, &target, 0, &term)?;
+            self.renderer.draw(&mut rec, &target, 0, term)?;
             rec.transition(
                 &target,
                 ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -897,6 +906,26 @@ mod tests {
         ] {
             assert_eq!(px(x, y), blue, "({x}, {y})");
         }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn scrolled_back_shows_history_without_a_cursor() {
+        let mut fixture = Fixture::new(None);
+        let cell = fixture.cell;
+        let mut term = Terminal::new(3, 2);
+        term.feed(b"\x1b]10;#ffffff;#000000;#ff0000\x07");
+        // "W" scrolls off; the screen has two empty rows, cursor at the top.
+        term.feed(b"W\r\n\r\n\x1b[H");
+        let (w, h) = (cell.width * 3, cell.height * 2);
+        let live = fixture.render(&term, w, h).unwrap();
+        assert!(live.is_cursor(0, 0));
+        assert_eq!(live.ink(0, 1), 0);
+
+        term.scroll_view(1);
+        let back = fixture.render(&term, w, h).unwrap();
+        assert!(back.ink(0, 0) > 0, "W, from the scrollback");
+        assert!(!back.pixels.contains(&RED), "no cursor");
     }
 
     /// A sample screen, mostly for VELLUM_DUMP_FRAME.
