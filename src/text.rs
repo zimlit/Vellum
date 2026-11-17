@@ -135,6 +135,34 @@ fn resolve(palette: &Palette, style: &Style) -> (Rgb, Rgb) {
     (fg, bg)
 }
 
+/// A message from vellum itself (a config error, say), shown in a bar over
+/// the bottom row until the front end drops it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub level: Level,
+    /// Only the first line is shown (the log has the rest).
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Warning,
+    Error,
+}
+
+impl Level {
+    /// Text and bar colors: fixed, not the palette, so a program's colors
+    /// can't hide the notice.
+    fn colors(self) -> (Rgb, Rgb) {
+        match self {
+            Level::Info => ([0xee, 0xee, 0xec], [0x20, 0x4a, 0x87]),
+            Level::Warning => ([0x2e, 0x34, 0x36], [0xed, 0xd4, 0x00]),
+            Level::Error => ([0xee, 0xee, 0xec], [0xa4, 0x00, 0x00]),
+        }
+    }
+}
+
 /// A glyph in the atlas, and where its bitmap goes relative to the cell's
 /// top-left corner.
 #[derive(Clone, Copy, Debug)]
@@ -207,17 +235,18 @@ impl TextRenderer {
     }
 
     /// Record a frame of `term`'s screen into `target`, using instance
-    /// buffer `slot`.
+    /// buffer `slot`, with `notice` over the bottom row.
     pub fn draw<T: RenderTarget>(
         &mut self,
         rec: &mut Recorder,
         target: &Arc<T>,
         slot: usize,
         term: &Terminal,
+        notice: Option<&Notice>,
     ) -> Result<()> {
         let (width, height) = target.size();
         let margins = Margins::new(self.cell(), term, width, height);
-        if let Err(e) = self.build(term, margins) {
+        if let Err(e) = self.build(term, margins, notice) {
             if e.downcast_ref::<AtlasFull>().is_none() {
                 return Err(e);
             }
@@ -225,7 +254,7 @@ impl TextRenderer {
             tracing::debug!(glyphs = self.cache.len(), "glyph atlas full; clearing it");
             self.raster.clear();
             self.cache.clear();
-            self.build(term, margins)
+            self.build(term, margins, notice)
                 .context("the glyphs on screen don't fit in the atlas")?;
         }
         self.raster.record(rec)?;
@@ -252,7 +281,7 @@ impl TextRenderer {
 
     /// Fill `self.instances` for `term`, queueing new glyphs. Fails with
     /// [`AtlasFull`] (inside the anyhow error) when the atlas runs out.
-    fn build(&mut self, term: &Terminal, margins: Margins) -> Result<()> {
+    fn build(&mut self, term: &Terminal, margins: Margins, notice: Option<&Notice>) -> Result<()> {
         self.instances.clear();
         self.decorations.clear();
         backgrounds(&mut self.instances, term, self.fonts.cell(), margins);
@@ -274,7 +303,38 @@ impl TextRenderer {
             }
         }
         self.instances.append(&mut self.decorations);
-        self.cursor(term)
+        self.cursor(term)?;
+        match notice {
+            Some(n) => self.notice(term, margins, n),
+            None => Ok(()),
+        }
+    }
+
+    /// A bar across the bottom row (and the margins beside and below it)
+    /// with the first line of the notice's text, cut to fit.
+    fn notice(&mut self, term: &Terminal, margins: Margins, notice: &Notice) -> Result<()> {
+        let cell = self.cell();
+        let row = term.rows() - 1;
+        let (fg, bg) = notice.level.colors();
+        let width = margins.left + u32::from(term.cols()) * cell.width + margins.right;
+        self.instances.push(Instance::solid(
+            0,
+            row,
+            (-(margins.left as i32), 0),
+            (width, cell.height + margins.bottom),
+            bg,
+        ));
+        let text = notice.text.lines().next().unwrap_or_default();
+        // A space before the text, so it doesn't touch the screen's edge.
+        for (col, ch) in (1..term.cols()).zip(text.chars()) {
+            if ch != ' '
+                && !ch.is_control()
+                && let Some(p) = self.glyph(Face::new(false, false), ch)?
+            {
+                self.instances.push(Instance::glyph(col, row, p, fg));
+            }
+        }
+        Ok(())
     }
 
     fn cursor(&mut self, term: &Terminal) -> Result<()> {
@@ -781,6 +841,16 @@ mod tests {
 
         /// Draw `term` into a `width` x `height` frame and read it back.
         fn render(&mut self, term: &Terminal, width: u32, height: u32) -> Result<Frame> {
+            self.render_with(term, width, height, None)
+        }
+
+        fn render_with(
+            &mut self,
+            term: &Terminal,
+            width: u32,
+            height: u32,
+            notice: Option<&Notice>,
+        ) -> Result<Frame> {
             let device = &self.device;
             let target = Image::new(
                 device,
@@ -804,7 +874,7 @@ mod tests {
                 Access::NONE,
                 Access::COLOR_ATTACHMENT,
             );
-            self.renderer.draw(&mut rec, &target, 0, term)?;
+            self.renderer.draw(&mut rec, &target, 0, term, notice)?;
             rec.transition(
                 &target,
                 ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1063,5 +1133,40 @@ mod tests {
         assert_ne!(italic, f.cell_pixels(0, 0));
         assert!(f.ink(3, 0) > f.ink(2, 0), "bold italic heavier than italic");
         assert_eq!(fixture.renderer.cache.len(), 4, "one entry per face");
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with a connected display; run with --ignored"]
+    fn notice_bar_covers_the_bottom_row_and_margins() {
+        let mut fixture = Fixture::new(None);
+        let cell = fixture.cell;
+        let mut term = Terminal::new(4, 2);
+        term.feed(b"\x1b]10;#ffffff;#000000;#ff0000\x07HHHH\r\nHHHH\x1b[?25l");
+        let notice = Notice {
+            level: Level::Error,
+            text: "E\nsecond line not shown".into(),
+        };
+        // 3 px of margin on every side.
+        let (w, h) = (4 * cell.width + 6, 2 * cell.height + 6);
+        let f = fixture.render_with(&term, w, h, Some(&notice)).unwrap();
+        let px = |x: u32, y: u32| f.pixels[(y * w + x) as usize];
+        let (fg, bg) = Level::Error.colors();
+        let bar = [bg[0], bg[1], bg[2], 255];
+        let bottom = 3 + cell.height;
+        // The bar: the bottom row's first cell (left of the text), and the
+        // margins beside and below it, corners included.
+        for (x, y) in [(0, h - 1), (w - 1, h - 1), (0, bottom), (3, bottom + 1)] {
+            assert_eq!(px(x, y), bar, "({x}, {y})");
+        }
+        // The top row is untouched: its H is still white ink.
+        assert!(f.pixels[..(w * bottom) as usize].contains(&WHITE));
+        // The text's E is drawn in the notice color, from the second column.
+        let e = (0..cell.height).flat_map(|y| (0..cell.width).map(move |x| (x, y)));
+        let text = [fg[0], fg[1], fg[2], 255];
+        let inked = e
+            .map(|(x, y)| px(3 + cell.width + x, bottom + y))
+            .filter(|&p| p == text)
+            .count();
+        assert!(inked > 0, "E drawn");
     }
 }

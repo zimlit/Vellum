@@ -42,13 +42,14 @@ use rustix::net::{
 use rustix::process::{Pid, PidfdFlags, Signal};
 
 use crate::event::Poller;
-use crate::pty::{self, WinSize};
+use crate::pty::{self, ShellSpec, WinSize};
 use crate::signals::{self, SignalFd};
 
 /// The listening socket's fd number in the server process.
 const LISTEN_FD: RawFd = 3;
-/// Largest message either side sends.
-const MAX_MESSAGE: usize = 256;
+/// Largest message either side sends (an attach carries the configured
+/// shell command and environment).
+const MAX_MESSAGE: usize = 64 * 1024;
 
 /// Where the session socket lives: `$VELLUM_SESSION_SOCKET`, else
 /// `$XDG_RUNTIME_DIR/vellum/session.sock`.
@@ -68,8 +69,9 @@ fn socket_path_from(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
-    /// Start the shell at this size if needed, and send its PTY master.
-    Attach(WinSize),
+    /// Start the shell at this size if needed (as `shell` says), and send
+    /// its PTY master.
+    Attach { size: WinSize, shell: ShellSpec },
     /// The front end is quitting on purpose: hang up the shell.
     Close,
 }
@@ -92,10 +94,19 @@ const REPLY_ATTACHED: u8 = 1;
 impl Request {
     fn encode(&self) -> Vec<u8> {
         match self {
-            Request::Attach(s) => {
+            Request::Attach { size: s, shell } => {
                 let mut msg = vec![REQ_ATTACH];
                 for v in [s.cols, s.rows, s.width, s.height] {
                     msg.extend_from_slice(&v.to_le_bytes());
+                }
+                put_count(&mut msg, shell.argv.len());
+                for arg in &shell.argv {
+                    put_str(&mut msg, arg);
+                }
+                put_count(&mut msg, shell.env.len());
+                for (k, v) in &shell.env {
+                    put_str(&mut msg, k);
+                    put_str(&mut msg, v);
                 }
                 msg
             }
@@ -105,14 +116,25 @@ impl Request {
 
     fn decode(msg: &[u8]) -> io::Result<Self> {
         match msg {
-            [REQ_ATTACH, rest @ ..] if rest.len() == 8 => {
-                let u16_at = |i: usize| u16::from_le_bytes([rest[i], rest[i + 1]]);
-                Ok(Request::Attach(WinSize {
-                    cols: u16_at(0),
-                    rows: u16_at(2),
-                    width: u16_at(4),
-                    height: u16_at(6),
-                }))
+            [REQ_ATTACH, rest @ ..] => {
+                let mut r = Reader(rest);
+                let size = WinSize {
+                    cols: r.u16()?,
+                    rows: r.u16()?,
+                    width: r.u16()?,
+                    height: r.u16()?,
+                };
+                let argv = (0..r.u16()?).map(|_| r.str()).collect::<io::Result<_>>()?;
+                let env = (0..r.u16()?)
+                    .map(|_| Ok((r.str()?, r.str()?)))
+                    .collect::<io::Result<_>>()?;
+                if !r.0.is_empty() {
+                    return Err(invalid("trailing bytes in attach request".into()));
+                }
+                Ok(Request::Attach {
+                    size,
+                    shell: ShellSpec { argv, env },
+                })
             }
             [REQ_CLOSE] => Ok(Request::Close),
             _ => Err(invalid(format!("malformed request {msg:02x?}"))),
@@ -152,6 +174,43 @@ impl Reply {
             }
             _ => Err(invalid(format!("malformed reply {msg:02x?}"))),
         }
+    }
+}
+
+/// A list's length. Callers check the whole message against
+/// [`MAX_MESSAGE`], which keeps lists far below `u16::MAX`.
+fn put_count(msg: &mut Vec<u8>, n: usize) {
+    msg.extend_from_slice(&(n.min(u16::MAX.into()) as u16).to_le_bytes());
+}
+
+fn put_str(msg: &mut Vec<u8>, s: &str) {
+    msg.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    msg.extend_from_slice(s.as_bytes());
+}
+
+/// Reads a message front to back; running out early means it's malformed.
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> io::Result<&[u8]> {
+        if self.0.len() < n {
+            return Err(invalid("truncated request".into()));
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u16(&mut self) -> io::Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn str(&mut self) -> io::Result<String> {
+        let b = self.take(4)?;
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        String::from_utf8(self.take(len)?.to_vec())
+            .map_err(|_| invalid("a string in the request isn't UTF-8".into()))
     }
 }
 
@@ -248,11 +307,11 @@ impl Attachment {
 }
 
 /// Attach to the shell behind `path`, starting the server if it isn't
-/// running.
-pub fn attach(path: &Path, size: WinSize) -> Result<Attachment> {
+/// running. `shell` is what to run if the shell has to be started.
+pub fn attach(path: &Path, size: WinSize, shell: &ShellSpec) -> Result<Attachment> {
     let mut last_error = None;
     for _ in 0..3 {
-        match try_attach(path, size) {
+        match try_attach(path, size, shell) {
             Ok(a) => return Ok(a),
             // A server that was exiting as we connected, or another front end
             // that bound the socket first: try again.
@@ -274,7 +333,7 @@ pub fn attach(path: &Path, size: WinSize) -> Result<Attachment> {
     Err(last_error.unwrap()).context(format!("attaching to {}", path.display()))
 }
 
-fn try_attach(path: &Path, size: WinSize) -> io::Result<Attachment> {
+fn try_attach(path: &Path, size: WinSize, shell: &ShellSpec) -> io::Result<Attachment> {
     let conn = match connect(path) {
         Ok(conn) => conn,
         Err(e)
@@ -287,12 +346,23 @@ fn try_attach(path: &Path, size: WinSize) -> io::Result<Attachment> {
         }
         Err(e) => return Err(e),
     };
-    request_attach(conn, size)
+    request_attach(conn, size, shell)
 }
 
-fn request_attach(conn: OwnedFd, size: WinSize) -> io::Result<Attachment> {
-    send(&conn, &Request::Attach(size).encode(), None)?;
-    let mut buf = [0u8; MAX_MESSAGE];
+fn request_attach(conn: OwnedFd, size: WinSize, shell: &ShellSpec) -> io::Result<Attachment> {
+    let request = Request::Attach {
+        size,
+        shell: shell.clone(),
+    }
+    .encode();
+    if request.len() > MAX_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the shell command and environment are too long (over {MAX_MESSAGE} bytes)"),
+        ));
+    }
+    send(&conn, &request, None)?;
+    let mut buf = vec![0u8; MAX_MESSAGE];
     let (n, fd) = recv(&conn, &mut buf)?;
     if n == 0 {
         return Err(io::Error::new(
@@ -396,7 +466,7 @@ pub fn main(path: PathBuf) -> Result<()> {
         {
             let info = pty::TermInfo::install();
             tracing::info!(term = info.term(), "shell terminfo");
-            Box::new(move || pty::shell_command(&info))
+            Box::new(move |spec: &ShellSpec| pty::shell_command(&info, spec))
         },
         Some(signals),
     )?
@@ -422,7 +492,7 @@ pub struct Server {
     listener: OwnedFd,
     /// Socket file to remove on exit.
     path: Option<PathBuf>,
-    command: Box<dyn Fn() -> Command>,
+    command: Box<dyn Fn(&ShellSpec) -> Command>,
     signals: Option<SignalFd>,
     poller: Poller,
     clients: HashMap<u64, OwnedFd>,
@@ -431,11 +501,12 @@ pub struct Server {
 }
 
 impl Server {
-    /// `command` builds the program to run on the PTY.
+    /// `command` builds the program to run on the PTY, from what the
+    /// attaching front end asked for.
     pub fn new(
         listener: OwnedFd,
         path: Option<PathBuf>,
-        command: Box<dyn Fn() -> Command>,
+        command: Box<dyn Fn(&ShellSpec) -> Command>,
         signals: Option<SignalFd>,
     ) -> io::Result<Self> {
         let poller = Poller::new()?;
@@ -502,7 +573,7 @@ impl Server {
         let Some(conn) = self.clients.get(&token) else {
             return false;
         };
-        let mut buf = [0u8; MAX_MESSAGE];
+        let mut buf = vec![0u8; MAX_MESSAGE];
         let result = match recv(conn, &mut buf) {
             Ok((0, _)) => Ok(None),
             Ok((n, _)) => Request::decode(&buf[..n]).map(Some),
@@ -525,8 +596,8 @@ impl Server {
 
     fn handle(&mut self, token: u64, req: Request) -> io::Result<()> {
         match req {
-            Request::Attach(size) => {
-                let result = self.ensure_shell(size);
+            Request::Attach { size, shell } => {
+                let result = self.ensure_shell(size, &shell);
                 let conn = &self.clients[&token];
                 match result {
                     Ok(spawned) => {
@@ -558,14 +629,14 @@ impl Server {
     }
 
     /// Start the shell if there is none. Returns whether it was started.
-    fn ensure_shell(&mut self, size: WinSize) -> io::Result<bool> {
+    fn ensure_shell(&mut self, size: WinSize, spec: &ShellSpec) -> io::Result<bool> {
         if let Some(shell) = &self.shell {
             return match shell.master {
                 Some(_) => Ok(false),
                 None => Err(io::Error::other("the shell is exiting")),
             };
         }
-        let mut spawned = pty::spawn((self.command)(), size)?;
+        let mut spawned = pty::spawn((self.command)(spec), size)?;
         let pidfd =
             rustix::process::pidfd_open(Pid::from_child(&spawned.child), PidfdFlags::empty())
                 .map_err(io::Error::from)
@@ -657,7 +728,22 @@ mod tests {
 
     #[test]
     fn requests_round_trip() {
-        for req in [Request::Attach(SIZE), Request::Close] {
+        // Encoded only, never run.
+        let shell = ShellSpec {
+            argv: vec!["/bin/sh".into(), "-l".into()],
+            env: vec![
+                ("EDITOR".into(), "emacs".into()),
+                ("EMPTY".into(), String::new()),
+            ],
+        };
+        for req in [
+            Request::Attach {
+                size: SIZE,
+                shell: ShellSpec::default(),
+            },
+            Request::Attach { size: SIZE, shell },
+            Request::Close,
+        ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
         }
     }
@@ -686,6 +772,20 @@ mod tests {
             Request::decode(&[REQ_ATTACH, 1, 2]).is_err(),
             "short attach"
         );
+        let mut attach = Request::Attach {
+            size: SIZE,
+            shell: ShellSpec {
+                argv: vec!["sh".into()],
+                env: vec![],
+            },
+        }
+        .encode();
+        assert!(
+            Request::decode(&attach[..attach.len() - 1]).is_err(),
+            "string cut short"
+        );
+        attach.push(0);
+        assert!(Request::decode(&attach).is_err(), "trailing byte");
         assert!(Request::decode(&[REQ_CLOSE, 0]).is_err(), "trailing bytes");
         assert!(Request::decode(&[9]).is_err(), "unknown op");
         assert!(
@@ -752,8 +852,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let server_path = path.clone();
         std::thread::spawn(move || {
-            let command = Box::new(|| {
+            let command = Box::new(|spec: &ShellSpec| {
                 let mut cmd = Command::new("/bin/sh");
+                cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
                 pty::terminal_env(&mut cmd, &pty::TermInfo::Fallback).env("PS1", "$ ");
                 cmd
             });
@@ -787,12 +888,23 @@ mod tests {
         let dir = TempDir::new();
         let (path, done) = start(&dir);
 
-        let first = request_attach(connect(&path).unwrap(), SIZE).unwrap();
+        let shell = ShellSpec {
+            argv: vec![],
+            env: vec![("FROM_CONFIG".into(), "first".into())],
+        };
+        let first = request_attach(connect(&path).unwrap(), SIZE, &shell).unwrap();
         assert!(first.spawned);
         shell_says(&first, "echo $((6*7))", "42");
         shell_says(&first, "stty size", "30 100");
+        shell_says(&first, "echo env=$FROM_CONFIG", "env=first");
 
-        let second = request_attach(connect(&path).unwrap(), SIZE).unwrap();
+        // Already running: the second front end's shell settings don't
+        // matter.
+        let other = ShellSpec {
+            argv: vec![],
+            env: vec![("FROM_CONFIG".into(), "second".into())],
+        };
+        let second = request_attach(connect(&path).unwrap(), SIZE, &other).unwrap();
         assert!(!second.spawned);
         assert_eq!(second.pid, first.pid);
 
@@ -807,13 +919,14 @@ mod tests {
         let dir = TempDir::new();
         let (path, done) = start(&dir);
 
-        let first = request_attach(connect(&path).unwrap(), SIZE).unwrap();
+        let shell = ShellSpec::default();
+        let first = request_attach(connect(&path).unwrap(), SIZE, &shell).unwrap();
         shell_says(&first, "x=kept", "$ ");
         // A crash: connection and master go away without Close.
         let pid = first.pid;
         drop(first);
 
-        let again = request_attach(connect(&path).unwrap(), SIZE).unwrap();
+        let again = request_attach(connect(&path).unwrap(), SIZE, &shell).unwrap();
         assert!(!again.spawned);
         assert_eq!(again.pid, pid);
         shell_says(&again, "echo $x", "kept");
@@ -825,7 +938,7 @@ mod tests {
     fn server_exits_when_the_shell_does() {
         let dir = TempDir::new();
         let (path, done) = start(&dir);
-        let a = request_attach(connect(&path).unwrap(), SIZE).unwrap();
+        let a = request_attach(connect(&path).unwrap(), SIZE, &ShellSpec::default()).unwrap();
         rustix::io::write(&a.master, b"exit\n").unwrap();
         let (_, hung_up) = read_until(&a.master, Duration::from_secs(10), |_| false);
         assert!(hung_up);

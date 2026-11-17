@@ -226,7 +226,7 @@ fn repeat_state_clears() {
 
 #[test]
 fn repeat_timer_disarms() {
-    let mut r = KeyRepeat::new().unwrap();
+    let mut r = KeyRepeat::new(Duration::from_millis(600), Duration::from_millis(40)).unwrap();
     r.press(KEY_A, true).unwrap();
     r.release(KEY_A).unwrap();
     assert_eq!(r.expired().unwrap(), None, "nothing expired, nothing held");

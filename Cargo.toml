@@ -10,7 +10,10 @@ drm = "0.15"
 input = "0.10"
 libc = "0.2"
 libseat = "0.2"
+mlua = { version = "=0.12.2", features = ["luajit", "serde"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "pty", "stdio", "termios", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
 skrifa = "=0.49.0" # shares read-fonts 0.46 with harfrust 0.15 (step 9); upgrade together
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

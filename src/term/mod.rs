@@ -25,6 +25,7 @@ use std::collections::HashSet;
 
 pub use cell::{Cell, Color, Flags, Style, Underline};
 pub use palette::Palette;
+use palette::{Colors, Entry};
 pub use parser::{Params, Parser, Perform};
 pub use screen::Line;
 pub use scrollback::Scrollback;
@@ -213,9 +214,11 @@ pub struct Terminal {
     modes: Modes,
     cursor_shape: CursorShape,
     cursor_blink: bool,
+    /// What DECSCUSR 0 (and a reset) returns to.
+    default_cursor: (CursorShape, bool),
     tabs: Vec<bool>,
     title: String,
-    palette: Palette,
+    colors: Colors,
     /// For REP.
     last_printed: Option<char>,
     /// Kitty keyboard protocol modes for the primary and alternate screens.
@@ -253,9 +256,10 @@ impl Terminal {
             modes: Modes::default(),
             cursor_shape: CursorShape::default(),
             cursor_blink: true,
+            default_cursor: (CursorShape::default(), true),
             tabs: default_tabs(cols),
             title: String::new(),
-            palette: Palette::default(),
+            colors: Colors::default(),
             last_printed: None,
             keyboard: Default::default(),
             dcs: None,
@@ -329,7 +333,28 @@ impl Terminal {
     }
 
     pub fn palette(&self) -> &Palette {
-        &self.palette
+        self.colors.live()
+    }
+
+    /// The colors from the configuration. Colors a program changed stay
+    /// as it set them until it resets them.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.colors.configure(palette);
+    }
+
+    /// The cursor style from the configuration, which DECSCUSR 0 and resets
+    /// return to. Applies now unless the program chose a style.
+    pub fn set_default_cursor(&mut self, shape: CursorShape, blink: bool) {
+        if (self.cursor_shape, self.cursor_blink) == self.default_cursor {
+            (self.cursor_shape, self.cursor_blink) = (shape, blink);
+        }
+        self.default_cursor = (shape, blink);
+    }
+
+    /// Keep at most `lines` of scrollback, dropping the oldest over it.
+    pub fn set_scrollback_limit(&mut self, lines: usize) {
+        self.scrollback.set_limit(lines);
+        self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
     pub fn title(&self) -> &str {
@@ -682,11 +707,15 @@ impl Terminal {
         let reported = std::mem::take(&mut self.reported);
         let replies = std::mem::take(&mut self.replies);
         let cell_pixels = self.cell_pixels;
+        let configured = self.colors.configured().clone();
+        let default_cursor = self.default_cursor;
         *self = Self::new(self.cols, self.rows);
         self.scrollback = scrollback;
         self.reported = reported;
         self.replies = replies;
         self.cell_pixels = cell_pixels;
+        self.colors = Colors::new(configured);
+        self.set_default_cursor(default_cursor.0, default_cursor.1);
     }
 
     /// DECALN: fill the screen with `E` (a test pattern).
@@ -788,7 +817,8 @@ impl Terminal {
 
     fn set_cursor_style(&mut self, style: u16) {
         let (shape, blink) = match style {
-            0 | 1 => (CursorShape::Block, true),
+            0 => self.default_cursor,
+            1 => (CursorShape::Block, true),
             2 => (CursorShape::Block, false),
             3 => (CursorShape::Underline, true),
             4 => (CursorShape::Underline, false),
@@ -876,7 +906,7 @@ impl Terminal {
             (true, 6) => self.reply(format!("\x1b[?{row};{col};1R").as_bytes()),
             // Color scheme: 1 dark, 2 light.
             (true, 996) => {
-                let p = &self.palette;
+                let p = self.colors.live();
                 let scheme = if reply::is_dark(p.foreground, p.background) {
                     1
                 } else {
@@ -994,11 +1024,11 @@ impl Terminal {
                     let spec = pair.get(1).copied().unwrap_or_default();
                     match (index, spec) {
                         (Some(i), b"?") => {
-                            let rgb = self.palette.colors[usize::from(i)];
+                            let rgb = self.colors.get(Entry::Indexed(i));
                             self.report_color(&format!("4;{i}"), rgb, bell);
                         }
                         (Some(i), spec) if let Some(rgb) = palette::parse_color(spec) => {
-                            self.palette.colors[usize::from(i)] = rgb;
+                            self.colors.set(Entry::Indexed(i), rgb);
                         }
                         _ => self.unhandled(format!("OSC 4 {}", pair.join(&b';').escape_ascii())),
                     }
@@ -1006,14 +1036,14 @@ impl Terminal {
             }
             Some(104) => {
                 if args.iter().all(|a| a.is_empty()) {
-                    self.palette.colors = std::array::from_fn(palette::default_color);
+                    self.colors.reset_indexed();
                 }
                 for a in args {
                     if let Some(i) = std::str::from_utf8(a)
                         .ok()
                         .and_then(|s| s.parse::<u8>().ok())
                     {
-                        self.palette.colors[usize::from(i)] = palette::default_color(i.into());
+                        self.colors.reset(Entry::Indexed(i));
                     }
                 }
             }
@@ -1022,34 +1052,18 @@ impl Terminal {
             Some(n @ 10..=12) => {
                 for (which, spec) in (n..=12).zip(args) {
                     if *spec == b"?" {
-                        let rgb = *self.dynamic_color(which);
+                        let rgb = self.colors.get(dynamic_color(which));
                         self.report_color(&which.to_string(), rgb, bell);
                         continue;
                     }
                     match palette::parse_color(spec) {
-                        Some(rgb) => *self.dynamic_color(which) = rgb,
+                        Some(rgb) => self.colors.set(dynamic_color(which), rgb),
                         None => self.unhandled(format!("OSC {which} {}", spec.escape_ascii())),
                     }
                 }
             }
-            Some(n @ 110..=112) => {
-                let default = Palette::default();
-                let color = self.dynamic_color(n - 100);
-                *color = match n {
-                    110 => default.foreground,
-                    111 => default.background,
-                    _ => default.cursor,
-                };
-            }
+            Some(n @ 110..=112) => self.colors.reset(dynamic_color(n - 100)),
             _ => self.unhandled(format!("OSC {}", params[0].escape_ascii())),
-        }
-    }
-
-    fn dynamic_color(&mut self, which: u16) -> &mut palette::Rgb {
-        match which {
-            10 => &mut self.palette.foreground,
-            11 => &mut self.palette.background,
-            _ => &mut self.palette.cursor,
         }
     }
 
@@ -1064,6 +1078,15 @@ impl Terminal {
         if self.reported.len() < MAX_REPORTED && self.reported.insert(what.clone()) {
             tracing::debug!(target: "vellum::term", "unhandled: {what}");
         }
+    }
+}
+
+/// The color OSC 10 / 11 / 12 (or 110 / 111 / 112, less 100) is about.
+fn dynamic_color(which: u16) -> Entry {
+    match which {
+        10 => Entry::Foreground,
+        11 => Entry::Background,
+        _ => Entry::Cursor,
     }
 }
 

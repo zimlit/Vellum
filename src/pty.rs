@@ -236,12 +236,32 @@ impl Writer {
     }
 }
 
-/// The user's shell (`$SHELL`, else `/bin/sh`) with the [`terminal_env`].
-pub fn shell_command(info: &TermInfo) -> Command {
-    let shell = std::env::var_os("SHELL")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let mut cmd = Command::new(shell);
+/// What to run for a new shell, from the config.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShellSpec {
+    /// The program, then its arguments. Empty: the user's shell.
+    pub argv: Vec<String>,
+    /// Extra environment variables.
+    pub env: Vec<(String, String)>,
+}
+
+/// The shell to run: `spec`'s program, else the user's shell (`$SHELL`,
+/// else `/bin/sh`), with `spec`'s environment and then the
+/// [`terminal_env`] (which the config can't override: it describes vellum).
+pub fn shell_command(info: &TermInfo, spec: &ShellSpec) -> Command {
+    let mut cmd = match spec.argv.split_first() {
+        Some((program, args)) => {
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+        None => Command::new(
+            std::env::var_os("SHELL")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "/bin/sh".into()),
+        ),
+    };
+    cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
     terminal_env(&mut cmd, info);
     cmd
 }
@@ -357,7 +377,10 @@ pub mod tests {
 
     #[test]
     fn shell_command_describes_vellum() {
-        let cmd = shell_command(&TermInfo::Vellum("/data/vellum/terminfo".into()));
+        let cmd = shell_command(
+            &TermInfo::Vellum("/data/vellum/terminfo".into()),
+            &ShellSpec::default(),
+        );
         let envs: Vec<_> = cmd.get_envs().collect();
         let has = |k: &str, v: &str| envs.contains(&(k.as_ref(), Some(v.as_ref())));
         assert!(has("TERM", "xterm-vellum"));
@@ -367,10 +390,30 @@ pub mod tests {
         // Another terminal's markers are removed (None: unset).
         assert!(envs.contains(&("VTE_VERSION".as_ref(), None)));
 
-        let cmd = shell_command(&TermInfo::Fallback);
+        let cmd = shell_command(&TermInfo::Fallback, &ShellSpec::default());
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&("TERM".as_ref(), Some("xterm-256color".as_ref()))));
         assert!(!envs.iter().any(|(k, _)| *k == "TERMINFO"));
+    }
+
+    #[test]
+    fn shell_command_from_the_config() {
+        let spec = ShellSpec {
+            argv: vec!["/bin/sh".into(), "-l".into()],
+            env: vec![
+                ("EDITOR".into(), "emacs".into()),
+                ("TERM".into(), "dumb".into()),
+            ],
+        };
+        let cmd = shell_command(&TermInfo::Fallback, &spec);
+        assert_eq!(cmd.get_program(), "/bin/sh");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-l"]);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&("EDITOR".as_ref(), Some("emacs".as_ref()))));
+        assert!(
+            envs.contains(&("TERM".as_ref(), Some("xterm-256color".as_ref()))),
+            "TERM describes vellum, whatever the config says"
+        );
     }
 
     #[test]

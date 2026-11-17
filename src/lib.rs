@@ -6,6 +6,7 @@
 //! end ([`frontend`]) or the session server ([`server`]).
 
 pub mod cli;
+pub mod config;
 pub mod dmabuf;
 pub mod event;
 pub mod font;

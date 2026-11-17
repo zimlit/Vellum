@@ -846,3 +846,47 @@ fn view_resets_on_alternate_screen_and_clears() {
     t.feed(b"\x1b[?1049l");
     assert_eq!(view(&t), ["17", "18", "19"]);
 }
+
+#[test]
+fn resets_return_to_the_configured_colors() {
+    let mut configured = Palette::default();
+    configured.colors[1] = [1, 1, 1];
+    configured.background = [2, 2, 2];
+    let mut t = Terminal::new(10, 1);
+    t.set_palette(configured.clone());
+    assert_eq!(t.palette(), &configured);
+    t.feed(b"\x1b]4;1;#ffffff\x07\x1b]11;#ffffff\x07");
+    t.feed(b"\x1b]104;1\x07\x1b]111\x07");
+    assert_eq!(t.palette(), &configured);
+    // RIS keeps the configuration.
+    t.feed(b"\x1b]4;1;#ffffff\x07\x1bc");
+    assert_eq!(t.palette(), &configured);
+}
+
+#[test]
+fn cursor_style_reset_returns_to_the_configured_one() {
+    let mut t = Terminal::new(10, 1);
+    t.set_default_cursor(CursorShape::Bar, true);
+    assert_eq!(t.cursor().shape, CursorShape::Bar, "applies at once");
+    t.feed(b"\x1b[2 q");
+    // A program's choice stays when the configuration changes...
+    t.set_default_cursor(CursorShape::Underline, true);
+    assert_eq!(t.cursor().shape, CursorShape::Block);
+    // ...until it asks for the default.
+    t.feed(b"\x1b[0 q");
+    assert_eq!(t.cursor().shape, CursorShape::Underline);
+    t.feed(b"\x1b[2 q\x1bc");
+    assert_eq!(t.cursor().shape, CursorShape::Underline, "RIS");
+}
+
+#[test]
+fn lowering_the_scrollback_limit_keeps_the_view_in_range() {
+    let mut t = Terminal::new(10, 2);
+    for i in 0..20 {
+        t.feed(format!("{i}\r\n").as_bytes());
+    }
+    t.scroll_view(isize::MAX);
+    assert_eq!(t.view_offset(), 19);
+    t.set_scrollback_limit(5);
+    assert_eq!(t.view_offset(), 5);
+}

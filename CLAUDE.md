@@ -39,6 +39,7 @@ Language: **Rust** (all crate choices below assume it).
 | Input | `libinput` (`input` crate) + `xkbcommon` | evdev gives physical keycodes; xkbcommon turns them into keysyms and UTF-8. libinput opens devices through the libseat session (`src/input.rs`). Keymap from `--xkb-*` flags, else `XKB_DEFAULT_*`; compose from the locale. |
 | Key encoding | **Legacy xterm + kitty keyboard protocol** (`src/keys.rs`) | Pure function from key event + modes to bytes. Kitty flags have a push/pop stack per screen. Text comes from the keysym, not xkb's Ctrl transform; Ctrl combinations use xterm's table, falling back to the US layout's key. |
 | Session / VT | **libseat** (logind or seatd) | Lets it run without root; handles DRM master, device open/revoke and VT switching. |
+| Configuration | **Lua (LuaJIT) via `mlua`**, `init.lua` in `$XDG_CONFIG_HOME/vellum/` (`src/config/`) | A deliberate exception to own bindings: Lua's stack discipline, longjmp errors and GC-owned values are what mlua makes safe. System LuaJIT (pkg-config), safe libraries only (no `ffi`/`debug`). The Lua state lives on a **script thread**: the event loop never runs Lua; requests and replies are plain Rust data over channels plus an eventfd. No instruction hook (it would keep LuaJIT in its interpreter); a request unanswered after `script_timeout` gets a warning. Settings are read with serde from the merged `vellum.set{...}` tables. CLI flags win over the config. Errors show in a notice bar over the bottom row. |
 | Font discovery | **system fontconfig**, own FFI bindings | Also read per-font settings: `hintstyle`, `antialias`, `rgba`, `lcdfilter`. Hand-written bindings like `gbm.rs`. |
 | Shaping | **HarfRust** | HarfBuzz's official Rust port, built on `read-fonts`. Preferred over swash's shaper, which covers less. |
 | Outlines / hinting | **skrifa** (fontations) | FreeType-quality hinted outlines (TrueType bytecode, CFF, autohinter). It does NOT rasterize. |
@@ -135,7 +136,7 @@ Notes:
 7. **VT switching:** survive Ctrl+Alt+Fn away and back repeatedly. Comes after input because the seat sets the console keyboard to `K_OFF`: the kernel never sees Ctrl+Alt+Fn, so we must detect it via libinput/xkb and call `libseat_switch_session`. Tested from SSH with `sudo scripts/vt-cycle.sh`.
 8. **Configuration and extensibility:** user settings (fonts, colors, keymap, key bindings, scrollback, ...) and a way to extend vellum. Technology and design are decided when this step is planned.
 9. **HarfRust shaping**, fallback fonts, ligatures, wide chars, procedural box drawing.
-10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint).
+10. Polish: damage tracking, latency-tuned frame pacing, honoring fontconfig hinting/AA, LCD subpixel, color emoji (COLR via skrifa paint). A bigger notice area: today's notice bar is one line, cut to the screen width, which long messages (serde's "expected one of ..." lists grow with every setting) outgrow; make it multi-line and scrollable, like Emacs's minibuffer/echo area.
 11. Embedded Wayland compositor (see above).
 
 ## References

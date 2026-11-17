@@ -42,6 +42,121 @@ impl Default for Palette {
     }
 }
 
+/// One changeable color: a palette entry or a default color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Indexed(u8),
+    Foreground,
+    Background,
+    Cursor,
+}
+
+impl Entry {
+    fn index(self) -> usize {
+        match self {
+            Entry::Indexed(i) => usize::from(i),
+            Entry::Foreground => 256,
+            Entry::Background => 257,
+            Entry::Cursor => 258,
+        }
+    }
+}
+
+/// The colors a program sees: the configured palette, with the entries the
+/// program changed (OSC 4 / 10 / 11 / 12). Resets (OSC 104 / 110–112) go
+/// back to the configured colors, and a new configuration leaves the
+/// program's changes in place.
+#[derive(Clone, Debug)]
+pub struct Colors {
+    configured: Palette,
+    live: Palette,
+    /// By [`Entry::index`]: changed by the program.
+    changed: [bool; 259],
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Self::new(Palette::default())
+    }
+}
+
+impl Colors {
+    pub fn new(configured: Palette) -> Self {
+        Self {
+            live: configured.clone(),
+            configured,
+            changed: [false; 259],
+        }
+    }
+
+    /// The colors to draw with.
+    pub fn live(&self) -> &Palette {
+        &self.live
+    }
+
+    pub fn get(&self, entry: Entry) -> Rgb {
+        *slot(&self.live, entry)
+    }
+
+    /// A program changed `entry`.
+    pub fn set(&mut self, entry: Entry, rgb: Rgb) {
+        *slot_mut(&mut self.live, entry) = rgb;
+        self.changed[entry.index()] = true;
+    }
+
+    /// Back to the configured color.
+    pub fn reset(&mut self, entry: Entry) {
+        *slot_mut(&mut self.live, entry) = *slot(&self.configured, entry);
+        self.changed[entry.index()] = false;
+    }
+
+    /// Every palette entry (not the default colors) back to the configured
+    /// colors: OSC 104 with no arguments.
+    pub fn reset_indexed(&mut self) {
+        for i in 0..=255 {
+            self.reset(Entry::Indexed(i));
+        }
+    }
+
+    /// A new configuration: entries the program didn't change take the new
+    /// colors.
+    pub fn configure(&mut self, configured: Palette) {
+        self.configured = configured;
+        let entries = (0..=255).map(Entry::Indexed).chain([
+            Entry::Foreground,
+            Entry::Background,
+            Entry::Cursor,
+        ]);
+        for e in entries {
+            if !self.changed[e.index()] {
+                *slot_mut(&mut self.live, e) = *slot(&self.configured, e);
+            }
+        }
+    }
+
+    pub fn configured(&self) -> &Palette {
+        &self.configured
+    }
+}
+
+fn slot(p: &Palette, entry: Entry) -> &Rgb {
+    match entry {
+        Entry::Indexed(i) => &p.colors[usize::from(i)],
+        Entry::Foreground => &p.foreground,
+        Entry::Background => &p.background,
+        Entry::Cursor => &p.cursor,
+    }
+}
+
+fn slot_mut(p: &mut Palette, entry: Entry) -> &mut Rgb {
+    match entry {
+        Entry::Indexed(i) => &mut p.colors[usize::from(i)],
+        Entry::Foreground => &mut p.foreground,
+        Entry::Background => &mut p.background,
+        Entry::Cursor => &mut p.cursor,
+    }
+}
+
 /// Palette entry `i` before any changes: the 16 base colors, then the
 /// 6×6×6 color cube, then 24 grays (the xterm layout).
 pub fn default_color(i: usize) -> Rgb {
@@ -107,6 +222,32 @@ mod tests {
         assert_eq!(p.colors[231], [255, 255, 255]);
         assert_eq!(p.colors[232], [8, 8, 8]);
         assert_eq!(p.colors[255], [238, 238, 238]);
+    }
+
+    #[test]
+    fn program_changes_survive_a_new_configuration() {
+        let mut c = Colors::default();
+        c.set(Entry::Indexed(1), [1, 1, 1]);
+        c.set(Entry::Background, [2, 2, 2]);
+        let mut configured = Palette::default();
+        configured.colors[1] = [9, 9, 9];
+        configured.colors[2] = [8, 8, 8];
+        configured.background = [7, 7, 7];
+        configured.foreground = [6, 6, 6];
+        c.configure(configured);
+        let live = c.live();
+        assert_eq!(live.colors[1], [1, 1, 1], "kept: the program set it");
+        assert_eq!(live.background, [2, 2, 2]);
+        assert_eq!(live.colors[2], [8, 8, 8], "configured");
+        assert_eq!(live.foreground, [6, 6, 6]);
+        // Resets go to the configured colors, and later configurations
+        // apply again.
+        c.reset(Entry::Background);
+        assert_eq!(c.get(Entry::Background), [7, 7, 7]);
+        c.reset_indexed();
+        assert_eq!(c.get(Entry::Indexed(1)), [9, 9, 9]);
+        c.configure(Palette::default());
+        assert_eq!(c.live(), &Palette::default());
     }
 
     #[test]

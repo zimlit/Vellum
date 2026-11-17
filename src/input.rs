@@ -30,11 +30,6 @@ use xkbcommon::xkb::{self, Keycode, Keysym, compose};
 use crate::keys::{KeyEvent, KeyKind, Mods};
 use crate::session::Session;
 
-/// Delay before a held key starts repeating.
-pub const REPEAT_DELAY: Duration = Duration::from_millis(600);
-/// Time between repeats (25 per second).
-pub const REPEAT_INTERVAL: Duration = Duration::from_millis(40);
-
 /// evdev keycodes are xkb keycodes minus 8 (a leftover from X11, where
 /// keycodes below 8 were reserved).
 const EVDEV_OFFSET: u32 = 8;
@@ -42,7 +37,8 @@ const EVDEV_OFFSET: u32 = 8;
 /// The xkb RMLVO names (rules, model, layout, variant, options). Empty
 /// fields, and `options: None`, let libxkbcommon use `XKB_DEFAULT_*` from
 /// the environment, then the system default (`evdev`, `pc105`, `us`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleNames {
     pub rules: String,
     pub model: String,
@@ -362,10 +358,14 @@ impl RepeatState {
 pub struct KeyRepeat {
     timer: OwnedFd,
     state: RepeatState,
+    /// Before a held key starts repeating.
+    delay: Duration,
+    /// Between repeats.
+    interval: Duration,
 }
 
 impl KeyRepeat {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(delay: Duration, interval: Duration) -> io::Result<Self> {
         let timer = timerfd_create(
             TimerfdClockId::Monotonic,
             TimerfdFlags::NONBLOCK | TimerfdFlags::CLOEXEC,
@@ -373,6 +373,8 @@ impl KeyRepeat {
         Ok(Self {
             timer,
             state: RepeatState::default(),
+            delay,
+            interval,
         })
     }
 
@@ -395,7 +397,7 @@ impl KeyRepeat {
     fn apply(&self, timer: Timer) -> io::Result<()> {
         let (value, interval) = match timer {
             Timer::Unchanged => return Ok(()),
-            Timer::Start => (REPEAT_DELAY, REPEAT_INTERVAL),
+            Timer::Start => (self.delay, self.interval),
             // A zero value disarms the timer.
             Timer::Stop => (Duration::ZERO, Duration::ZERO),
         };

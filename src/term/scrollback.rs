@@ -57,6 +57,14 @@ impl Scrollback {
     pub fn clear(&mut self) {
         self.lines.clear();
     }
+
+    /// Keep at most `limit` lines from now on, dropping the oldest ones
+    /// over it.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        let excess = self.lines.len().saturating_sub(limit);
+        self.lines.drain(..excess);
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +103,19 @@ mod tests {
         };
         sb.push(l);
         assert_eq!(sb.line(0).cells.len(), 6);
+    }
+
+    #[test]
+    fn lowering_the_limit_drops_the_oldest() {
+        let mut sb = Scrollback::new(10);
+        for t in ["one", "two", "three"] {
+            sb.push(line(t, 80));
+        }
+        sb.set_limit(2);
+        assert_eq!(sb.len(), 2);
+        assert_eq!(sb.line(0).text(), "two");
+        sb.push(line("four", 80));
+        assert_eq!(sb.line(0).text(), "three");
     }
 
     #[test]

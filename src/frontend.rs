@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use rustix::io::Errno;
 
 use crate::cli::Args;
+use crate::config::{self, Reply, Request, Script, Settings};
 use crate::event::Poller;
 use crate::font::{Face, FontSet, fontconfig};
 use crate::input::{Binding, Devices, Key, KeyRepeat, Keyboard, Scroll};
@@ -39,7 +40,7 @@ use crate::scanout::{
 use crate::session::{Session, SessionEvent};
 use crate::signals::{self, SignalFd};
 use crate::term::Terminal;
-use crate::text::{self, TextRenderer};
+use crate::text::{self, Level, Notice, TextRenderer};
 use crate::{gbm, pty, server, vk};
 
 const BUFFER_COUNT: usize = 2;
@@ -48,6 +49,13 @@ const BUFFER_COUNT: usize = 2;
 /// other terminals use), in case it never ends it.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// Longest the display waits for the config at startup (it needs the
+/// font); after that vellum starts with the built-in settings.
+const FIRST_LOAD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a notice stays up, unless a key is pressed first.
+const NOTICE_TIME: Duration = Duration::from_secs(10);
+
 // Event loop tokens.
 const SEAT: u64 = 0;
 const SIGNALS: u64 = 1;
@@ -55,24 +63,33 @@ const CARD: u64 = 2;
 const PTY: u64 = 3;
 const INPUT: u64 = 4;
 const REPEAT: u64 = 5;
+const SCRIPT: u64 = 6;
 
 pub fn run(args: Args) -> Result<()> {
     // Before any threads exist, so they all inherit the blocked mask.
     let signals = SignalFd::new(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT])
         .context("setting up signalfd")?;
+    // After the signal mask is set, so the script thread inherits it.
+    let mut script = Script::start().context("starting the script thread")?;
+    script.send(Request::Load(config::path(&args.config)));
+
     let path = kms::find_card()?;
     tracing::info!(card = %path.display(), "using DRM device");
 
     if args.probe {
+        let (settings, _) = first_load(&mut script, &args);
         let card = Card::open_direct(&path)?;
-        return probe(&card, &args);
+        return probe(&card, &settings);
     }
 
     // Shared with libinput, which opens input devices through it.
     let session = Rc::new(RefCell::new(Session::open()?));
     let card = Card::new(session.borrow_mut().open_device(&path)?);
     let output = prepare(&card)?;
-    let font = load_font(&args.font, output.dpi())?;
+    let (settings, notice) = first_load(&mut script, &args);
+    // Shown until a key is pressed or NOTICE_TIME passes.
+    let mut notice = notice.map(|n| (n, Instant::now()));
+    let font = load_font(&settings.font, output.dpi())?;
 
     let (w, h) = output.mode.size();
     let cell = font.cell();
@@ -84,7 +101,11 @@ pub fn run(args: Args) -> Result<()> {
         height: (u32::from(rows) * cell.height).min(u16::MAX.into()) as u16,
     };
     let socket = server::socket_path()?;
-    let shell = server::attach(&socket, size)?;
+    let shell_spec = pty::ShellSpec {
+        argv: settings.shell.clone(),
+        env: settings.env.clone().into_iter().collect(),
+    };
+    let shell = server::attach(&socket, size, &shell_spec)?;
     rustix::fs::fcntl_setfl(&shell.master, rustix::fs::OFlags::NONBLOCK)
         .context("making the PTY non-blocking")?;
     // Reattaching to a running shell: make sure it has our size.
@@ -105,7 +126,9 @@ pub fn run(args: Args) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, BUFFER_COUNT)?;
-    let mut term = Terminal::new(cols, rows);
+    let mut term = Terminal::with_scrollback(cols, rows, settings.scrollback);
+    term.set_palette(settings.colors.palette());
+    term.set_default_cursor(settings.cursor_style.into(), true);
     term.set_cell_pixels(
         cell.width.min(u16::MAX.into()) as u16,
         cell.height.min(u16::MAX.into()) as u16,
@@ -114,7 +137,7 @@ pub fn run(args: Args) -> Result<()> {
     // First frame: render, wait on the CPU, and modeset with it.
     let start = Instant::now();
     render(&mut buffers[0], |rec, image| {
-        text.draw(rec, image, 0, &term)
+        text.draw(rec, image, 0, &term, notice.as_ref().map(|(n, _)| n))
     })?;
     buffers[0].cmd.wait()?;
 
@@ -129,11 +152,7 @@ pub fn run(args: Args) -> Result<()> {
         connector = %output.connector_name,
         mode = %format_args!("{w}x{h}@{}", output.mode.vrefresh()),
         gpu = device.name(),
-        "display taken over; running {}",
-        match args.seconds {
-            0 => "until Ctrl+Alt+Backspace or SIGTERM".to_owned(),
-            s => format!("for {s}s"),
-        }
+        "display taken over; running until Ctrl+Alt+Backspace or SIGTERM"
     );
 
     // Buffer `shown` is on screen; `next` is free to render into, or being
@@ -146,8 +165,9 @@ pub fn run(args: Args) -> Result<()> {
     let mut sync_since: Option<Instant> = None;
     let mut frames = 1u64;
 
-    let mut keyboard = Keyboard::new(&args.keymap)?;
-    let mut repeat = KeyRepeat::new().context("creating the key repeat timer")?;
+    let mut keyboard = Keyboard::new(&settings.keymap)?;
+    let mut repeat = KeyRepeat::new(settings.repeat_delay(), settings.repeat_interval())
+        .context("creating the key repeat timer")?;
     // Dropped first, closing the input devices while the seat is still ours.
     let mut devices = Devices::new(session.clone()).context("starting libinput")?;
 
@@ -158,6 +178,7 @@ pub fn run(args: Args) -> Result<()> {
     poller.add(&shell.master, PTY)?;
     poller.add(&devices, INPUT)?;
     poller.add(&repeat, REPEAT)?;
+    poller.add(&script, SCRIPT)?;
     let mut ready = Vec::new();
     let mut pty_buf = vec![0u8; 64 * 1024];
     // What goes to the shell (keys, and replies to its queries),
@@ -166,17 +187,37 @@ pub fn run(args: Args) -> Result<()> {
     let mut watching_writable = false;
     let mut shell_alive = true;
 
-    let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
     'events: loop {
         let now = Instant::now();
-        if deadline.is_some_and(|d| d <= now) {
-            break;
+        if notice
+            .as_ref()
+            .is_some_and(|(_, shown)| now >= *shown + NOTICE_TIME)
+        {
+            notice = None;
+            dirty = true;
         }
-        // Wake for the end of the run, and for a held-back frame.
+        let script_timeout = settings.script_timeout();
+        if script.overdue(script_timeout, now) {
+            let secs = script_timeout.unwrap_or_default().as_secs_f64();
+            tracing::warn!("the config script hasn't answered for {secs}s");
+            notice = Some((
+                Notice {
+                    level: Level::Warning,
+                    text: format!(
+                        "the config script hasn't answered for {secs}s (stuck in a loop?)"
+                    ),
+                },
+                now,
+            ));
+            dirty = true;
+        }
+        // Wake for a held-back frame, a notice to take down, and a script
+        // that may become overdue.
         let sync_end = sync_since
             .map(|since| since + SYNC_TIMEOUT)
             .filter(|&end| dirty && end > now);
-        let timeout = [deadline, sync_end]
+        let notice_end = notice.as_ref().map(|(_, shown)| *shown + NOTICE_TIME);
+        let timeout = [sync_end, notice_end, script.deadline(script_timeout)]
             .into_iter()
             .flatten()
             .min()
@@ -261,6 +302,11 @@ pub fn run(args: Args) -> Result<()> {
                         .dispatch(|key| keys.push(key))
                         .context("reading input events")?;
                     for Key { code, pressed } in keys {
+                        // Any key press takes a notice down (and still
+                        // does what it does).
+                        if pressed && notice.take().is_some() {
+                            dirty = true;
+                        }
                         let kind = if pressed {
                             repeat.press(code, keyboard.repeats(code))
                         } else {
@@ -294,6 +340,20 @@ pub fn run(args: Args) -> Result<()> {
                         }
                     }
                 }
+                SCRIPT => {
+                    for reply in script.replies() {
+                        match reply {
+                            // Only a first load that missed the startup
+                            // wait gets here; applying settings while
+                            // running comes with reloading.
+                            Reply::Loaded(Ok(_)) => tracing::info!(
+                                "the config finished after vellum started without it; \
+                                 it applies at the next start"
+                            ),
+                            Reply::Loaded(Err(_)) => {}
+                        }
+                    }
+                }
                 _ => unreachable!("unknown event token {token}"),
             }
         }
@@ -314,7 +374,7 @@ pub fn run(args: Args) -> Result<()> {
         if dirty && !flip_pending && !held && !display.paused() {
             let slot = next;
             let flip = queue_frame(&mut display, &mut buffers[slot], |rec, image| {
-                text.draw(rec, image, slot, &term)
+                text.draw(rec, image, slot, &term, notice.as_ref().map(|(n, _)| n))
             })?;
             // Lost: the seat took DRM master for a switch and its event is
             // on the way. The frame is drawn again after resuming.
@@ -337,6 +397,38 @@ pub fn run(args: Args) -> Result<()> {
         tracing::warn!("asking the session server to close the shell: {e}");
     }
     Ok(())
+}
+
+/// Wait for the config the script thread was asked to run, since the
+/// display needs its font. A config that fails, or doesn't finish within
+/// [`FIRST_LOAD_TIMEOUT`], leaves the built-in settings and a notice saying
+/// why. Command-line flags apply either way.
+fn first_load(script: &mut Script, args: &Args) -> (Settings, Option<Notice>) {
+    let (settings, notice) = match script.wait(FIRST_LOAD_TIMEOUT) {
+        Some(Reply::Loaded(Ok(settings))) => (settings, None),
+        // The script thread logged the whole error.
+        Some(Reply::Loaded(Err(e))) => (
+            Settings::default(),
+            Some(Notice {
+                level: Level::Error,
+                text: format!("config error, using the built-in settings: {e}"),
+            }),
+        ),
+        None => {
+            let secs = FIRST_LOAD_TIMEOUT.as_secs();
+            tracing::warn!("the config didn't finish within {secs}s; using the built-in settings");
+            (
+                Settings::default(),
+                Some(Notice {
+                    level: Level::Warning,
+                    text: format!(
+                        "the config didn't finish within {secs}s; using the built-in settings"
+                    ),
+                }),
+            )
+        }
+    };
+    (settings.with_cli(args), notice)
 }
 
 /// What the event loop does after a key.
@@ -489,9 +581,9 @@ fn load_font(pattern: &str, dpi: f64) -> Result<FontSet> {
 ///
 /// The interesting details (output, GPU, modifiers, buffer layout) are logged
 /// by the shared setup functions; run with `VELLUM_LOG=debug` to see them all.
-fn probe(card: &Card, args: &Args) -> Result<()> {
+fn probe(card: &Card, settings: &Settings) -> Result<()> {
     let output = prepare(card)?;
-    let font = load_font(&args.font, output.dpi())?;
+    let font = load_font(&settings.font, output.dpi())?;
     let (w, h) = output.mode.size();
     let (cols, rows) = text::grid_size(font.cell(), w.into(), h.into());
     let instance = vk::Instance::new(cfg!(debug_assertions))?;
@@ -502,13 +594,14 @@ fn probe(card: &Card, args: &Args) -> Result<()> {
     let format = vk::vk_format(scanout::FORMAT).context("scanout format")?;
     let mut text = TextRenderer::new(&device, font, format, 1)?;
     let mut term = Terminal::new(cols, rows);
+    term.set_palette(settings.colors.palette());
     term.feed(
         b"\x1b[1mvellum --probe\x1b[m\r\n\
           The quick brown fox jumps over the lazy dog. 0123456789 {}[]()<>\r\n\
           \x1b(0lqqqk\r\nx   x\r\nmqqqj\x1b(B",
     );
     let start = Instant::now();
-    render(&mut buf, |rec, image| text.draw(rec, image, 0, &term))?;
+    render(&mut buf, |rec, image| text.draw(rec, image, 0, &term, None))?;
     buf.cmd.wait()?;
     tracing::info!(
         render_time = ?start.elapsed(),
