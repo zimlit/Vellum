@@ -19,7 +19,7 @@
 //! the scrollback while scrolled back.
 //!
 //! See `shaders/cell.vert` and `shaders/cell.frag`. The whole screen is
-//! redrawn every frame; damage tracking comes later (roadmap step 10).
+//! redrawn every frame; damage tracking comes later (roadmap step 11).
 
 use std::collections::HashMap;
 use std::sync::Arc;
